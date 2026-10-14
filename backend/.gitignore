@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Environment Variables (Protects Groq, Cartesia, LiveKit, & OpenAI keys)
+.env
+.env.*
+!.env.example
+
+# Nano / Terminal backup files (Blocks .env.save)
+*.save
+*.swp
+*~
+
+# Build & Runtime
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/

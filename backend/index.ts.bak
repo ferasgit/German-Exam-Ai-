@@ -1,0 +1,215 @@
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { createServer } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import Groq from "groq-sdk";
+import "dotenv/config";
+
+const app = new Hono();
+app.use("*", cors());
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
+
+app.get("/", (c) => c.json({ status: "Backend running - Cartesia + Groq" }));
+
+const SYSTEM_PROMPTS: Record<string, string> = {
+  PREPARATION: `You are a professional German speaking exam invigilator.
+LANGUAGE RULE: Always respond in the SAME language the student uses.
+If student speaks English reply in English. If student speaks German reply in German.
+Welcome the student. Explain 3 exam parts: speech, partner, debate.
+Topic: "Beschreiben Sie Ihre Heimatstadt". Ask student to begin. Keep SHORT.`,
+
+  USER_SPEECH: `You are the German exam invigilator.
+LANGUAGE RULE: Respond in SAME language as student.
+Student is presenting speech. Listen, ask ONE follow-up question at a time.
+Correct mistakes politely. Encourage. Keep under 3 sentences.`,
+
+  AI_PARTNER_SPEECH: `You are a friendly AI speaking partner in a German exam.
+LANGUAGE RULE: Respond in SAME language as student.
+Topic: "Sollte Online-Lernen Schulen ersetzen?"
+Give short opinion, ask student ONE question. Be friendly. Keep SHORT.`,
+
+  DEBATE: `You are an AI debate partner in a German exam.
+LANGUAGE RULE: Respond in SAME language as student.
+Topic: "Sollten soziale Medien fur Jugendliche begrenzt werden?"
+Argue FOR limiting social media. Challenge politely. Keep SHORT.`,
+
+  RESULT: `You are the German exam invigilator giving final feedback.
+Speak mainly English. Give structured feedback:
+Vocabulary: X/10, Fluency: X/10, Grammar: X/10, Confidence: X/10, Overall: X/40.
+End with warm encouragement.`,
+};
+
+const VOICES: Record<string, string> = {
+  invigilator: "225ba8cf-9fc2-4371-a78c-fe38ba38898a",
+  partner: "d6b0c62a-c7ff-477c-9a1f-eadd64b94360",
+};
+
+type Message = { role: string; content: string };
+const sessions = new Map<string, Message[]>();
+
+const server = createServer();
+const wss = new WebSocketServer({ server, path: "/voice" });
+
+wss.on("connection", (ws: WebSocket) => {
+  console.log("Client connected");
+
+  let currentStage = "PREPARATION";
+  const sessionId = "session_" + Date.now();
+  sessions.set(sessionId, []);
+
+  async function generateAndSpeak(userText: string, stage: string): Promise<void> {
+    try {
+      ws.send(JSON.stringify({ type: "processing" }));
+
+      const history = sessions.get(sessionId) || [];
+      history.push({ role: "user", content: userText });
+      if (history.length > 20) history.splice(0, history.length - 20);
+      sessions.set(sessionId, history);
+
+      console.log("LLM stage:", stage, "user:", userText.slice(0, 50));
+
+      const response = await groq.chat.completions.create({
+        model: "openai/gpt-oss-120b",
+        reasoning_effort: "low",
+        messages: [
+          { role: "system" as const, content: SYSTEM_PROMPTS[stage] || SYSTEM_PROMPTS["PREPARATION"] },
+          ...history.map((m) => ({
+            role: (m.role === "user" ? "user" : "assistant") as "user" | "assistant",
+            content: m.content || "",
+          })),
+        ],
+        max_tokens: 400,
+        temperature: 0.7,
+      });
+
+      const aiText = response.choices[0]?.message?.content || "";
+      history.push({ role: "assistant", content: aiText });
+      sessions.set(sessionId, history);
+
+      console.log("LLM:", aiText.slice(0, 80));
+      ws.send(JSON.stringify({ type: "transcript_ai", text: aiText }));
+
+      const voiceId = (stage === "AI_PARTNER_SPEECH" || stage === "DEBATE")
+        ? VOICES["partner"]
+        : VOICES["invigilator"];
+
+      // Use Cartesia HTTP API — reliable, no WebSocket issues
+      const ttsRes = await fetch("https://api.cartesia.ai/tts/bytes", {
+        method: "POST",
+        headers: {
+          "X-API-Key": process.env.CARTESIA_API_KEY!,
+          "Cartesia-Version": "2024-11-13",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model_id: "sonic-3",
+          transcript: aiText,
+          voice: { mode: "id", id: voiceId },
+          output_format: {
+            container: "mp3",
+            bit_rate: 128000,
+            sample_rate: 44100,
+          },
+        }),
+      });
+
+      if (!ttsRes.ok) {
+        const err = await ttsRes.text();
+        console.error("Cartesia error:", err);
+        ws.send(JSON.stringify({ type: "error", message: err }));
+        return;
+      }
+
+      const audioBuffer = await ttsRes.arrayBuffer();
+      const audioBase64 = Buffer.from(audioBuffer).toString("base64");
+      console.log("Cartesia TTS done, size:", audioBuffer.byteLength);
+
+      ws.send(JSON.stringify({ type: "audio_mp3", data: audioBase64 }));
+      ws.send(JSON.stringify({ type: "turn_complete" }));
+
+    } catch (err) {
+      console.error("generateAndSpeak error:", err);
+      ws.send(JSON.stringify({ type: "error", message: String(err) }));
+    }
+  }
+
+  ws.on("message", async (data: Buffer) => {
+    try {
+      const text = data.toString("utf8");
+
+      if (text.startsWith("{")) {
+        const msg = JSON.parse(text) as Record<string, string>;
+
+        if (msg["type"] === "start") {
+          currentStage = msg["stage"] || "PREPARATION";
+          sessions.set(sessionId, []);
+          ws.send(JSON.stringify({ type: "connected", stage: currentStage }));
+
+          const firstMessages: Record<string, string> = {
+            PREPARATION: "welcome the student warmly and start the German speaking exam",
+            USER_SPEECH: "ask the student to begin their speech now",
+            AI_PARTNER_SPEECH: "introduce yourself as the speaking partner and start the discussion",
+            DEBATE: "start the debate now with your position",
+            RESULT: "give the student their detailed exam feedback and scores",
+          };
+
+          await generateAndSpeak(firstMessages[currentStage] || "start", currentStage);
+        }
+
+        if (msg["type"] === "stage_change") {
+          currentStage = msg["stage"] || "PREPARATION";
+
+          const firstMessages: Record<string, string> = {
+            PREPARATION: "welcome the student and start the exam",
+            USER_SPEECH: "ask the student to begin their speech",
+            AI_PARTNER_SPEECH: "introduce yourself as speaking partner and start",
+            DEBATE: "start the debate now",
+            RESULT: "give the student their exam feedback and scores",
+          };
+
+          await generateAndSpeak(firstMessages[currentStage] || "continue", currentStage);
+        }
+
+        if (msg["type"] === "interrupt") {
+          ws.send(JSON.stringify({ type: "interrupted" }));
+          console.log("Interrupted");
+        }
+
+      } else {
+        if (data.length < 3000) return;
+
+        console.log("STT: audio size:", data.length);
+
+        const audioFile = new File([data], "audio.webm", { type: "audio/webm" });
+
+        const transcription = await groq.audio.transcriptions.create({
+          file: audioFile,
+          model: "whisper-large-v3",
+          response_format: "json",
+        });
+
+        const userText = transcription.text?.trim();
+        if (!userText || userText.length < 2) return;
+
+        console.log("STT:", userText);
+        ws.send(JSON.stringify({ type: "transcript_user", text: userText }));
+        await generateAndSpeak(userText, currentStage);
+      }
+
+    } catch (err) {
+      console.error("WS message error:", err);
+      ws.send(JSON.stringify({ type: "error", message: String(err) }));
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("Client disconnected");
+    sessions.delete(sessionId);
+  });
+});
+
+server.listen(8787, () => {
+  console.log("Backend running on http://localhost:8787");
+  console.log("Voice WebSocket on ws://localhost:8787/voice");
+});
