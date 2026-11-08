@@ -4,26 +4,47 @@ import { useEffect, useRef, useState, useCallback } from "react";
 
 type ExamStage =
   | "PREPARATION"
-  | "USER_SPEECH"
-  | "AI_PARTNER_SPEECH"
+  | "INTRO"
+  | "USER_PRESENTATION"
+  | "USER_QA"
+  | "PARTNER_PRESENTATION"
+  | "PARTNER_QA"
   | "DEBATE"
   | "RESULT";
 
 const STAGE_SECONDS: Record<ExamStage, number> = {
   PREPARATION: 300,
-  USER_SPEECH: 180,
-  AI_PARTNER_SPEECH: 180,
-  DEBATE: 180,
+  INTRO: 60,
+  USER_PRESENTATION: 240,
+  USER_QA: 120,
+  PARTNER_PRESENTATION: 90,
+  PARTNER_QA: 120,
+  DEBATE: 300,
   RESULT: 0,
 };
 
 const NEXT_STAGE: Record<ExamStage, ExamStage | null> = {
-  PREPARATION: "USER_SPEECH",
-  USER_SPEECH: "AI_PARTNER_SPEECH",
-  AI_PARTNER_SPEECH: "DEBATE",
+  PREPARATION: "INTRO",
+  INTRO: "USER_PRESENTATION",
+  USER_PRESENTATION: "USER_QA",
+  USER_QA: "PARTNER_PRESENTATION",
+  PARTNER_PRESENTATION: "PARTNER_QA",
+  PARTNER_QA: "DEBATE",
   DEBATE: "RESULT",
   RESULT: null,
 };
+
+// false = the AI voice is never cut off by mic noise. Use headphones if you turn this on.
+const ALLOW_BARGE_IN = false;
+
+// Voice detection settings. Raise MIN_VOICED_MS or SPEECH_MARGIN if noise still gets through.
+const MIN_VOICED_MS = 400; // less real speech than this is ignored (coughs, clicks, breathing)
+const SPEECH_MARGIN = 8; // how far above the background noise a sound must be
+const MIN_THRESHOLD = 22; // never trigger below this level
+const IDLE_RESTART_MS = 3000; // while nobody speaks, throw away old recording this often
+const AFTER_AI_IGNORE_MS = 700; // ignore the mic briefly after the AI stops talking (echo tail)
+
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8787/voice";
 
 export default function ExamPage() {
   const [status, setStatus] = useState("Press Start Exam");
@@ -45,6 +66,12 @@ export default function ExamPage() {
   const audioChunksRef = useRef<Blob[]>([]);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const speechDetectedRef = useRef(false);
+  const noiseFloorRef = useRef(10);
+  const voicedMsRef = useRef(0);
+  const lastFrameRef = useRef(0);
+  const ignoreUntilRef = useRef(0);
+  const recorderBusyRef = useRef(false);
+  const lastRestartRef = useRef(0);
   const interruptSentRef = useRef(false);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -79,6 +106,31 @@ export default function ExamPage() {
   }, [examStarted, stage]);
 
   // =========================
+  // RESTART RECORDER (drops old audio such as AI echo and long silence)
+  // =========================
+  const restartRecorder = useCallback(async () => {
+    if (recorderBusyRef.current || !micStreamRef.current) return;
+    recorderBusyRef.current = true;
+    try {
+      const old = mediaRecorderRef.current;
+      if (old && old.state !== "inactive") {
+        old.stop();
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      audioChunksRef.current = [];
+      const mr = new MediaRecorder(micStreamRef.current, { mimeType: "audio/webm" });
+      mediaRecorderRef.current = mr;
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      mr.start(100);
+      lastRestartRef.current = performance.now();
+    } finally {
+      recorderBusyRef.current = false;
+    }
+  }, []);
+
+  // =========================
   // PLAY MP3 AUDIO
   // =========================
   const playAudioMp3 = useCallback(async (base64: string) => {
@@ -93,6 +145,14 @@ export default function ExamPage() {
       setIsSpeaking(true);
       isSpeakingRef.current = true;
       interruptSentRef.current = false;
+
+      // forget any half-detected speech, the AI is talking now
+      speechDetectedRef.current = false;
+      voicedMsRef.current = 0;
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
 
       const binary = atob(base64);
       const bytes = new Uint8Array(binary.length);
@@ -112,6 +172,12 @@ export default function ExamPage() {
         isSpeakingRef.current = false;
         interruptSentRef.current = false;
         setStatus("Listening... speak now 🎤");
+
+        // ignore the echo tail, then start a fresh recording without the AI voice in it
+        ignoreUntilRef.current = performance.now() + AFTER_AI_IGNORE_MS;
+        setTimeout(() => {
+          if (!speechDetectedRef.current) void restartRecorder();
+        }, AFTER_AI_IGNORE_MS);
       };
 
       audio.onerror = () => {
@@ -123,12 +189,13 @@ export default function ExamPage() {
 
       await audio.play();
     } catch (err) {
-      console.error("Audio play error:", err);
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      console.warn("Audio play error:", err);
       isPlayingRef.current = false;
       setIsSpeaking(false);
       isSpeakingRef.current = false;
     }
-  }, []);
+  }, [restartRecorder]);
 
   // =========================
   // PROCESS SPEECH
@@ -137,6 +204,10 @@ export default function ExamPage() {
     if (isSpeakingRef.current) return;
     if (!mediaRecorderRef.current) return;
 
+    const voicedMs = voicedMsRef.current;
+    voicedMsRef.current = 0;
+
+    recorderBusyRef.current = true;
     mediaRecorderRef.current.stop();
     await new Promise((r) => setTimeout(r, 200));
 
@@ -150,6 +221,14 @@ export default function ExamPage() {
         if (e.data.size > 0) audioChunksRef.current.push(e.data);
       };
       mr.start(100);
+      lastRestartRef.current = performance.now();
+    }
+    recorderBusyRef.current = false;
+
+    // not enough real speech: noise, a cough or breathing. Do not send it.
+    if (voicedMs < MIN_VOICED_MS) {
+      setStatus("Listening... speak now 🎤");
+      return;
     }
 
     if (audioBlob.size < 3000) return;
@@ -164,7 +243,7 @@ export default function ExamPage() {
   // =========================
   // CONNECT WEBSOCKET
   // =========================
-  const connectWS = useCallback((currentStage: ExamStage) => {
+  const connectWS = useCallback(async (currentStage: ExamStage) => {
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
@@ -173,7 +252,16 @@ export default function ExamPage() {
     isPlayingRef.current = false;
     setConnected(false);
 
-    const ws = new WebSocket("ws://localhost:8787/voice");
+    // token is only needed when the backend has WS_SECRET set (production)
+    let token = "";
+    try {
+      const r = await fetch("/api/ws-token");
+      if (r.ok) token = ((await r.json()) as { token?: string }).token || "";
+    } catch {
+      token = "";
+    }
+
+    const ws = new WebSocket(token ? `${WS_URL}?token=${encodeURIComponent(token)}` : WS_URL);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -207,7 +295,7 @@ export default function ExamPage() {
         }
 
         if (msg.type === "transcript_ai") {
-          setMessages((prev) => [...prev, `AI: ${msg.text as string}`]);
+          setMessages((prev) => [...prev, `${msg.speaker === "partner" ? "PARTNER (Josh)" : "EXAMINER (Rachel)"}: ${msg.text as string}`]);
         }
 
         if (msg.type === "transcript_user") {
@@ -228,8 +316,8 @@ export default function ExamPage() {
         }
 
         if (msg.type === "error") {
-          console.error("Backend error:", msg.message);
-          setStatus("Error — check console");
+          console.warn("Backend:", msg.message);
+          setStatus("Network problem — please speak again 🎤");
         }
 
       } catch (err) {
@@ -251,7 +339,7 @@ export default function ExamPage() {
   const startMic = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true }
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false }
       });
       micStreamRef.current = stream;
 
@@ -273,13 +361,32 @@ export default function ExamPage() {
       setIsListening(true);
 
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      // only the speech band, about 300 to 3400 Hz (31 Hz per bin at 16 kHz)
+      const LOW_BIN = 10;
+      const HIGH_BIN = 109;
+      lastFrameRef.current = performance.now();
+      lastRestartRef.current = performance.now();
 
       const checkVAD = () => {
         analyser.getByteFrequencyData(dataArray);
-        const volume = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+        let sum = 0;
+        for (let i = LOW_BIN; i <= HIGH_BIN; i++) sum += dataArray[i];
+        const volume = sum / (HIGH_BIN - LOW_BIN + 1);
+
+        const now = performance.now();
+        const dt = now - lastFrameRef.current;
+        lastFrameRef.current = now;
+        const busy = isSpeakingRef.current || now < ignoreUntilRef.current;
+
+        // learn the background noise level while nobody is speaking
+        if (!busy && !speechDetectedRef.current) {
+          noiseFloorRef.current = noiseFloorRef.current * 0.97 + volume * 0.03;
+        }
+        const threshold = Math.max(MIN_THRESHOLD, noiseFloorRef.current * 1.8 + SPEECH_MARGIN);
+        const loud = volume > threshold;
 
         // Auto interrupt — higher threshold to avoid false triggers
-        if (volume > 25 && isPlayingRef.current && !interruptSentRef.current) {
+        if (ALLOW_BARGE_IN && volume > 25 && isPlayingRef.current && !interruptSentRef.current && !["PREPARATION", "INTRO", "PARTNER_PRESENTATION"].includes(stageRef.current)) {
           interruptSentRef.current = true;
           if (wsRef.current?.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify({ type: "interrupt" }));
@@ -295,7 +402,8 @@ export default function ExamPage() {
         }
 
         // Speech detection
-        if (volume > 20 && !isSpeakingRef.current) {
+        if (loud && !busy) {
+          voicedMsRef.current += dt;
           if (!speechDetectedRef.current) {
             speechDetectedRef.current = true;
             setStatus("Speaking... 🎤");
@@ -304,7 +412,7 @@ export default function ExamPage() {
             clearTimeout(silenceTimerRef.current);
             silenceTimerRef.current = null;
           }
-        } else if (speechDetectedRef.current && !isSpeakingRef.current) {
+        } else if (speechDetectedRef.current && !busy) {
           if (!silenceTimerRef.current) {
             silenceTimerRef.current = setTimeout(async () => {
               speechDetectedRef.current = false;
@@ -312,6 +420,11 @@ export default function ExamPage() {
               await processSpeech();
             }, 1200);
           }
+        }
+
+        // idle: throw away old recording so silence and noise never pile up
+        if (!busy && !speechDetectedRef.current && !loud && !recorderBusyRef.current && now - lastRestartRef.current > IDLE_RESTART_MS) {
+          void restartRecorder();
         }
 
         requestAnimationFrame(checkVAD);
@@ -322,7 +435,7 @@ export default function ExamPage() {
       console.error("Mic error:", err);
       setStatus("Microphone error");
     }
-  }, [processSpeech]);
+  }, [processSpeech, restartRecorder]);
 
   // =========================
   // STAGE CHANGE
@@ -354,10 +467,8 @@ export default function ExamPage() {
   }
 
   function nextStage() {
-    if (stage === "PREPARATION") handleStageChange("USER_SPEECH");
-    else if (stage === "USER_SPEECH") handleStageChange("AI_PARTNER_SPEECH");
-    else if (stage === "AI_PARTNER_SPEECH") handleStageChange("DEBATE");
-    else if (stage === "DEBATE") handleStageChange("RESULT");
+    const nxt = NEXT_STAGE[stageRef.current];
+    if (nxt) handleStageChange(nxt);
   }
 
   useEffect(() => {
@@ -437,7 +548,7 @@ export default function ExamPage() {
             isListening ? "bg-green-500 animate-pulse" : "bg-gray-600"
           }`} />
           <p className="text-gray-400 text-sm">
-            {isSpeaking ? "AI speaking — start talking to interrupt" :
+            {isSpeaking ? "AI speaking — please listen" :
              isListening ? "Listening — speak naturally" : "Standby"}
           </p>
         </div>
@@ -449,7 +560,8 @@ export default function ExamPage() {
           {messages.length === 0 && <p className="text-gray-500">Start exam to begin...</p>}
           {messages.map((msg, i) => (
             <div key={i} className={`p-3 rounded-lg text-sm ${
-              msg.startsWith("AI:") ? "bg-blue-950 border border-blue-800" :
+              msg.startsWith("EXAMINER") ? "bg-blue-950 border border-blue-800" :
+              msg.startsWith("PARTNER") ? "bg-purple-950 border border-purple-800" :
               msg.startsWith("YOU:") ? "bg-gray-800 border border-gray-600" :
               "bg-gray-900 text-gray-500 text-center"
             }`}>{msg}</div>
