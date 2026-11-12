@@ -2,136 +2,259 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 
-type ExamStage = "PREPARATION" | "STAGE_1" | "STAGE_2" | "STAGE_3" | "RESULT";
+type ExamStage =
+  | "PREPARATION"
+  | "INTRO"
+  | "USER_PRESENTATION"
+  | "USER_QA"
+  | "PARTNER_PRESENTATION"
+  | "PARTNER_QA"
+  | "DEBATE"
+  | "RESULT";
 
-interface MessageItem {
-  id: string;
-  sender: "examiner" | "partner" | "user" | "system";
-  text: string;
-  time: string;
-}
+const STAGE_SECONDS: Record<ExamStage, number> = {
+  PREPARATION: 300,
+  INTRO: 60,
+  USER_PRESENTATION: 240,
+  USER_QA: 120,
+  PARTNER_PRESENTATION: 90,
+  PARTNER_QA: 120,
+  DEBATE: 300,
+  RESULT: 0,
+};
 
-const STAGES: { key: ExamStage; label: string; sub: string }[] = [
-  { key: "PREPARATION", label: "Prep", sub: "Einleitung" },
-  { key: "STAGE_1", label: "Stage 1", sub: "Vortrag (Me)" },
-  { key: "STAGE_2", label: "Stage 2", sub: "Diskussion (B)" },
-  { key: "STAGE_3", label: "Stage 3", sub: "Debatte" },
-  { key: "RESULT", label: "Evaluation", sub: "Ergebnis" },
+const NEXT_STAGE: Record<ExamStage, ExamStage | null> = {
+  PREPARATION: "INTRO",
+  INTRO: "USER_PRESENTATION",
+  USER_PRESENTATION: "USER_QA",
+  USER_QA: "PARTNER_PRESENTATION",
+  PARTNER_PRESENTATION: "PARTNER_QA",
+  PARTNER_QA: "DEBATE",
+  DEBATE: "RESULT",
+  RESULT: null,
+};
+
+// The stages where the user is just listening to the AI. 
+// Mic is disabled, and it auto-advances when the AI finishes speaking.
+const AUTO_ADVANCE_STAGES: ExamStage[] = ["PREPARATION", "INTRO", "PARTNER_PRESENTATION"];
+
+const STAGE_DISPLAY_GROUPS: { key: ExamStage; label: string; sub: string }[] = [
+  { key: "PREPARATION", label: "Prep", sub: "Vorbereitung" },
+  { key: "INTRO", label: "Intro", sub: "Einleitung" },
+  { key: "USER_PRESENTATION", label: "Teil 1", sub: "Vortrag (Me)" },
+  { key: "USER_QA", label: "Teil 1 Q&A", sub: "Fragen" },
+  { key: "PARTNER_PRESENTATION", label: "Teil 2", sub: "Vortrag (B)" },
+  { key: "PARTNER_QA", label: "Teil 2 Q&A", sub: "Diskussion" },
+  { key: "DEBATE", label: "Teil 3", sub: "Debatte" },
+  { key: "RESULT", label: "Ergebnis", sub: "Bewertung" },
 ];
 
-const TOPICS = [
-  {
-    stage: "STAGE_1",
-    badge: "Speech 1",
-    title: "Beschreiben Sie Ihre Heimatstadt",
-    bullets: [
-      "Wo liegt Ihre Heimatstadt und wie ist die Atmosphäre?",
-      "Wichtige Sehenswürdigkeiten und Freizeitmöglichkeiten",
-      "Persönliche Vor- und Nachteile des Lebens dort",
-    ],
-  },
-  {
-    stage: "STAGE_2",
-    badge: "Speech 2",
-    title: "Sollte Online-Lernen Schulen ersetzen?",
-    bullets: [
-      "Reagieren Sie auf die Argumente Ihres Partners (Lukas)",
-      "Vergleich: Traditioneller Unterricht vs. E-Learning",
-      "Eigene Erfahrungen und Empfehlungen teilen",
-    ],
-  },
-  {
-    stage: "STAGE_3",
-    badge: "Stage 3 Debatte",
-    title: "Soziale Medien für Jugendliche begrenzen?",
-    bullets: [
-      "Partner vertritt strikte Beschränkungen",
-      "Verteidigen Sie Ihren Standpunkt mit praktischen Beispielen",
-      "Einigen Sie sich am Ende auf einen gemeinsamen Kompromiss",
-    ],
-  },
-];
+const ALLOW_BARGE_IN = false;
+const MIN_VOICED_MS = 400;
+const SPEECH_MARGIN = 8;
+const MIN_THRESHOLD = 22;
+const IDLE_RESTART_MS = 3000;
+const AFTER_AI_IGNORE_MS = 700;
+
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8787/voice";
 
 export default function ExamPage() {
+  const [status, setStatus] = useState("Press Start Exam");
   const [stage, setStage] = useState<ExamStage>("PREPARATION");
-  const [timer, setTimer] = useState(300);
+  const [timer, setTimer] = useState(STAGE_SECONDS.PREPARATION);
+  const [messages, setMessages] = useState<
+    { id: string; sender: "examiner" | "partner" | "user" | "system"; text: string; time: string }[]
+  >([]);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   const [examStarted, setExamStarted] = useState(false);
   const [connected, setConnected] = useState(false);
-  const [status, setStatus] = useState("Klicken Sie auf 'Prüfung starten'");
-  const [isSpeaking, setIsSpeaking] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
   const [activeSpeaker, setActiveSpeaker] = useState<"examiner" | "partner" | "user" | null>(null);
-  const [messages, setMessages] = useState<MessageItem[]>([]);
   const [showResultModal, setShowResultModal] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const stageRef = useRef<ExamStage>("PREPARATION");
+  const isSpeakingRef = useRef(false);
+  const isPlayingRef = useRef(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const isPlayingRef = useRef(false);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const speechDetectedRef = useRef(false);
-  const stageRef = useRef<ExamStage>("PREPARATION");
+  const noiseFloorRef = useRef(10);
+  const voicedMsRef = useRef(0);
+  const lastFrameRef = useRef(0);
+  const ignoreUntilRef = useRef(0);
+  const recorderBusyRef = useRef(false);
+  const lastRestartRef = useRef(0);
+  const interruptSentRef = useRef(false);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  
+  // Ref to safely call handleStageChange inside callbacks without dependency cycles
+  const handleStageChangeRef = useRef<((s: ExamStage) => void) | null>(null);
 
   useEffect(() => {
     stageRef.current = stage;
   }, [stage]);
 
   useEffect(() => {
+    isSpeakingRef.current = isSpeaking;
+  }, [isSpeaking]);
+
+  useEffect(() => {
     chatScrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Timer Countdown
+  const topics = {
+    speech1: "Beschreiben Sie Ihre Heimatstadt.",
+    speech2: "Sollte Online-Lernen Schulen ersetzen?",
+    debate: "Sollten soziale Medien fur Jugendliche begrenzt werden?",
+  };
+
+  // =========================
+  // TIMER MECHANISM
+  // =========================
   useEffect(() => {
     if (!examStarted) return;
+    let left = STAGE_SECONDS[stage];
+    setTimer(left);
+    if (left <= 0) return;
     const interval = setInterval(() => {
-      setTimer((t) => (t > 0 ? t - 1 : 0));
+      left -= 1;
+      setTimer(left);
+      if (left <= 0) {
+        clearInterval(interval);
+        const nxt = NEXT_STAGE[stageRef.current];
+        if (nxt && handleStageChangeRef.current) handleStageChangeRef.current(nxt);
+      }
     }, 1000);
     return () => clearInterval(interval);
-  }, [examStarted]);
+  }, [examStarted, stage]);
 
-  // Audio Player
-  const playAudioMp3 = useCallback(async (base64: string) => {
+  // =========================
+  // RESTART RECORDER
+  // =========================
+  const restartRecorder = useCallback(async () => {
+    if (recorderBusyRef.current || !micStreamRef.current) return;
+    recorderBusyRef.current = true;
     try {
-      if (currentAudioRef.current) {
-        currentAudioRef.current.pause();
+      const old = mediaRecorderRef.current;
+      if (old && old.state !== "inactive") {
+        old.stop();
+        await new Promise((r) => setTimeout(r, 150));
       }
-      isPlayingRef.current = true;
-      setIsSpeaking(true);
-
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-
-      const blob = new Blob([bytes], { type: "audio/mp3" });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      currentAudioRef.current = audio;
-
-      audio.onended = () => {
-        URL.revokeObjectURL(url);
-        isPlayingRef.current = false;
-        setIsSpeaking(false);
-        setActiveSpeaker(null);
-        setStatus("Bereit. Bitte sprechen Sie...");
+      audioChunksRef.current = [];
+      const mr = new MediaRecorder(micStreamRef.current, { mimeType: "audio/webm" });
+      mediaRecorderRef.current = mr;
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
       };
-
-      await audio.play();
-    } catch {
-      isPlayingRef.current = false;
-      setIsSpeaking(false);
-      setActiveSpeaker(null);
+      mr.start(100);
+      lastRestartRef.current = performance.now();
+    } finally {
+      recorderBusyRef.current = false;
     }
   }, []);
 
-  // Process Speech
+  // =========================
+  // PLAY MP3 AUDIO & AUTO-ADVANCE LOGIC
+  // =========================
+  const playAudioMp3 = useCallback(
+    async (base64: string) => {
+      try {
+        if (currentAudioRef.current) {
+          currentAudioRef.current.pause();
+          currentAudioRef.current = null;
+        }
+
+        isPlayingRef.current = true;
+        setIsSpeaking(true);
+        isSpeakingRef.current = true;
+        interruptSentRef.current = false;
+
+        speechDetectedRef.current = false;
+        voicedMsRef.current = 0;
+        if (silenceTimerRef.current) {
+          clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = null;
+        }
+
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        const blob = new Blob([bytes], { type: "audio/mp3" });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        currentAudioRef.current = audio;
+
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
+          isPlayingRef.current = false;
+          currentAudioRef.current = null;
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          setActiveSpeaker(null);
+          interruptSentRef.current = false;
+
+          const currentStg = stageRef.current;
+          
+          // AUTO-ADVANCE LOGIC: If we are in Prep, Intro, or Partner Presentation, jump to next stage automatically!
+          if (AUTO_ADVANCE_STAGES.includes(currentStg)) {
+            setStatus("AI finished. Auto-advancing...");
+            setTimeout(() => {
+              const nxt = NEXT_STAGE[currentStg];
+              if (nxt && handleStageChangeRef.current) {
+                handleStageChangeRef.current(nxt);
+              }
+            }, 1200); // 1.2 second pause before jumping to next stage
+          } else {
+            // Normal behavior: turn the user's mic back on
+            setStatus("Listening... speak now 🎤");
+            ignoreUntilRef.current = performance.now() + AFTER_AI_IGNORE_MS;
+            setTimeout(() => {
+              if (!speechDetectedRef.current) void restartRecorder();
+            }, AFTER_AI_IGNORE_MS);
+          }
+        };
+
+        audio.onerror = () => {
+          isPlayingRef.current = false;
+          currentAudioRef.current = null;
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          setActiveSpeaker(null);
+        };
+
+        await audio.play();
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        console.warn("Audio play error:", err);
+        isPlayingRef.current = false;
+        setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        setActiveSpeaker(null);
+      }
+    },
+    [restartRecorder]
+  );
+
+  // =========================
+  // PROCESS SPEECH
+  // =========================
   const processSpeech = useCallback(async () => {
-    if (isPlayingRef.current || !mediaRecorderRef.current) return;
+    if (isSpeakingRef.current || !mediaRecorderRef.current) return;
+
+    const voicedMs = voicedMsRef.current;
+    voicedMsRef.current = 0;
+
+    recorderBusyRef.current = true;
     mediaRecorderRef.current.stop();
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 200));
 
     const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
     audioChunksRef.current = [];
@@ -139,96 +262,231 @@ export default function ExamPage() {
     if (micStreamRef.current) {
       const mr = new MediaRecorder(micStreamRef.current, { mimeType: "audio/webm" });
       mediaRecorderRef.current = mr;
-      mr.ondataavailable = (e) => e.data.size > 0 && audioChunksRef.current.push(e.data);
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
       mr.start(100);
+      lastRestartRef.current = performance.now();
+    }
+    recorderBusyRef.current = false;
+
+    if (voicedMs < MIN_VOICED_MS) {
+      if (!AUTO_ADVANCE_STAGES.includes(stageRef.current)) {
+        setStatus("Listening... speak now 🎤");
+      }
+      return;
     }
 
-    if (audioBlob.size > 2500 && wsRef.current?.readyState === WebSocket.OPEN) {
-      setStatus("Sprache wird analysiert...");
+    if (audioBlob.size < 3000) return;
+
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      setStatus("Processing speech...");
       const arrayBuffer = await audioBlob.arrayBuffer();
       wsRef.current.send(arrayBuffer);
     }
   }, []);
 
-  // WebSocket Connection
-  const connectWS = useCallback((initialStage: ExamStage) => {
-    if (wsRef.current) wsRef.current.close();
-    const ws = new WebSocket("ws://localhost:8787/voice");
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setConnected(true);
-      ws.send(JSON.stringify({ type: "start", stage: initialStage }));
-    };
-
-    ws.onmessage = async (e) => {
-      try {
-        const msg = JSON.parse(e.data as string);
-        if (msg.type === "connected") setStatus("Prüfungskammer aktiv");
-        if (msg.type === "audio_mp3") {
-          const speaker = stageRef.current === "STAGE_2" ? "partner" : "examiner";
-          setActiveSpeaker(speaker);
-          await playAudioMp3(msg.data as string);
-        }
-        if (msg.type === "transcript_ai") {
-          const sender = stageRef.current === "STAGE_2" ? "partner" : "examiner";
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: Math.random().toString(),
-              sender,
-              text: msg.text as string,
-              time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-            },
-          ]);
-        }
-        if (msg.type === "transcript_user") {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: Math.random().toString(),
-              sender: "user",
-              text: msg.text as string,
-              time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-            },
-          ]);
-        }
-      } catch (err) {
-        console.error("WS error:", err);
+  // =========================
+  // CONNECT WEBSOCKET
+  // =========================
+  const connectWS = useCallback(
+    async (currentStage: ExamStage) => {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
       }
-    };
 
-    ws.onclose = () => setConnected(false);
-  }, [playAudioMp3]);
+      isPlayingRef.current = false;
+      setConnected(false);
 
-  // Microphone Setup with Audio Visualizer
+      let token = "";
+      try {
+        const r = await fetch("/api/ws-token");
+        if (r.ok) token = ((await r.json()) as { token?: string }).token || "";
+      } catch {
+        token = "";
+      }
+
+      const ws = new WebSocket(token ? `${WS_URL}?token=${encodeURIComponent(token)}` : WS_URL);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: "start", stage: currentStage }));
+      };
+
+      ws.onmessage = async (event) => {
+        try {
+          const msg = JSON.parse(event.data as string);
+
+          if (msg.type === "connected") {
+            setConnected(true);
+            setStatus("Connected! Starting...");
+          }
+
+          if (msg.type === "processing") {
+            setStatus("AI thinking...");
+          }
+
+          if (msg.type === "audio_mp3") {
+            const speakerRole =
+              msg.speaker === "partner" ||
+              stageRef.current === "PARTNER_PRESENTATION" ||
+              stageRef.current === "PARTNER_QA"
+                ? "partner"
+                : "examiner";
+            setActiveSpeaker(speakerRole);
+            await playAudioMp3(msg.data as string);
+          }
+
+          if (msg.type === "transcript_ai") {
+            const isPartner =
+              msg.speaker === "partner" ||
+              stageRef.current === "PARTNER_PRESENTATION" ||
+              stageRef.current === "PARTNER_QA";
+
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: Math.random().toString(),
+                sender: isPartner ? "partner" : "examiner",
+                text: msg.text as string,
+                time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+              },
+            ]);
+          }
+
+          if (msg.type === "transcript_user") {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: Math.random().toString(),
+                sender: "user",
+                text: msg.text as string,
+                time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+              },
+            ]);
+          }
+
+          if (msg.type === "interrupted") {
+            if (currentAudioRef.current) {
+              currentAudioRef.current.pause();
+              currentAudioRef.current = null;
+            }
+            isPlayingRef.current = false;
+            setIsSpeaking(false);
+            isSpeakingRef.current = false;
+            setActiveSpeaker(null);
+            interruptSentRef.current = false;
+            setStatus("Listening... 🎤");
+          }
+
+          if (msg.type === "error") {
+            console.warn("Backend:", msg.message);
+            setStatus("Network problem — please speak again 🎤");
+          }
+        } catch (err) {
+          console.error("WS message error:", err);
+        }
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        setStatus("Disconnected");
+      };
+
+      ws.onerror = () => setStatus("Connection error");
+    },
+    [playAudioMp3]
+  );
+
+  // =========================
+  // MIC WITH ORIGINAL ACCURATE VAD
+  // =========================
   const startMic = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+      });
       micStreamRef.current = stream;
 
-      const audioCtx = new AudioContext({ sampleRate: 16000 });
-      audioContextRef.current = audioCtx;
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 128;
-      audioCtx.createMediaStreamSource(stream).connect(analyser);
+      const audioContext = new AudioContext({ sampleRate: 16000 });
+      audioContextRef.current = audioContext;
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
 
-      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
-      mediaRecorderRef.current = mr;
-      mr.ondataavailable = (e) => e.data.size > 0 && audioChunksRef.current.push(e.data);
-      mr.start(100);
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
 
-      const dataArr = new Uint8Array(analyser.frequencyBinCount);
-      const loop = () => {
-        analyser.getByteFrequencyData(dataArr);
-        const avg = dataArr.reduce((a, b) => a + b, 0) / dataArr.length;
-        setAudioLevel(Math.min(100, Math.round(avg * 2.5)));
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      mediaRecorder.start(100);
+      setIsListening(true);
 
-        if (avg > 18 && !isPlayingRef.current) {
-          setActiveSpeaker("user");
-          speechDetectedRef.current = true;
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-        } else if (speechDetectedRef.current && !isPlayingRef.current) {
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const LOW_BIN = 10;
+      const HIGH_BIN = 109;
+      lastFrameRef.current = performance.now();
+      lastRestartRef.current = performance.now();
+
+      const checkVAD = () => {
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = LOW_BIN; i <= HIGH_BIN; i++) sum += dataArray[i];
+        const volume = sum / (HIGH_BIN - LOW_BIN + 1);
+
+        setAudioLevel(Math.min(100, Math.round(volume * 2.5)));
+
+        const now = performance.now();
+        const dt = now - lastFrameRef.current;
+        lastFrameRef.current = now;
+        
+        // AUTO MUTING LOGIC: If in stage 1, 2, or 5, the mic ignores all noise entirely!
+        const isMicDisabled = AUTO_ADVANCE_STAGES.includes(stageRef.current);
+        const busy = isSpeakingRef.current || now < ignoreUntilRef.current || isMicDisabled;
+
+        if (!busy && !speechDetectedRef.current) {
+          noiseFloorRef.current = noiseFloorRef.current * 0.97 + volume * 0.03;
+        }
+        const threshold = Math.max(MIN_THRESHOLD, noiseFloorRef.current * 1.8 + SPEECH_MARGIN);
+        const loud = volume > threshold;
+
+        if (
+          ALLOW_BARGE_IN &&
+          volume > 25 &&
+          isPlayingRef.current &&
+          !interruptSentRef.current &&
+          !AUTO_ADVANCE_STAGES.includes(stageRef.current)
+        ) {
+          interruptSentRef.current = true;
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: "interrupt" }));
+          }
+          if (currentAudioRef.current) {
+            currentAudioRef.current.pause();
+            currentAudioRef.current = null;
+          }
+          isPlayingRef.current = false;
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          setStatus("Listening... 🎤");
+        }
+
+        if (loud && !busy) {
+          voicedMsRef.current += dt;
+          if (!speechDetectedRef.current) {
+            speechDetectedRef.current = true;
+            setActiveSpeaker("user");
+            setStatus("Speaking... 🎤");
+          }
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+        } else if (speechDetectedRef.current && !busy) {
           if (!silenceTimerRef.current) {
             silenceTimerRef.current = setTimeout(async () => {
               speechDetectedRef.current = false;
@@ -238,79 +496,159 @@ export default function ExamPage() {
             }, 1200);
           }
         }
-        requestAnimationFrame(loop);
+
+        if (
+          !busy &&
+          !speechDetectedRef.current &&
+          !loud &&
+          !recorderBusyRef.current &&
+          now - lastRestartRef.current > IDLE_RESTART_MS
+        ) {
+          void restartRecorder();
+        }
+
+        requestAnimationFrame(checkVAD);
       };
-      requestAnimationFrame(loop);
-    } catch {
-      setStatus("Mikrofon nicht verfügbar");
-    }
-  }, [processSpeech]);
 
-  const handleStartExam = async () => {
+      requestAnimationFrame(checkVAD);
+    } catch (err) {
+      console.error("Mic error:", err);
+      setStatus("Microphone error");
+    }
+  }, [processSpeech, restartRecorder]);
+
+  // =========================
+  // STAGE HANDLERS
+  // =========================
+  function handleStageChange(newStage: ExamStage) {
+    setStage(newStage);
+    stageRef.current = newStage;
+    
+    // Update status to reflect if mic is disabled in the new stage
+    if (AUTO_ADVANCE_STAGES.includes(newStage)) {
+      setStatus("Nur Zuhören (AI speaking)");
+    } else {
+      setStatus("Bereit. Bitte sprechen Sie...");
+    }
+
+    if (newStage === "RESULT") {
+      setShowResultModal(true);
+    }
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    isPlayingRef.current = false;
+    setIsSpeaking(false);
+    isSpeakingRef.current = false;
+    setActiveSpeaker(null);
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: Math.random().toString(),
+        sender: "system",
+        text: `--- ${newStage} ---`,
+        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      },
+    ]);
+
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "stage_change", stage: newStage }));
+    } else {
+      void connectWS(newStage);
+    }
+  }
+
+  // Bind function to ref so callbacks can use it safely
+  handleStageChangeRef.current = handleStageChange;
+
+  async function startExam() {
     setExamStarted(true);
+    setStatus("Starting...");
     await startMic();
-    connectWS("PREPARATION");
-  };
+    void connectWS("PREPARATION");
+  }
 
-  const handleNextStage = () => {
-    const stageOrder: ExamStage[] = ["PREPARATION", "STAGE_1", "STAGE_2", "STAGE_3", "RESULT"];
-    const currIdx = stageOrder.indexOf(stage);
-    if (currIdx < stageOrder.length - 1) {
-      const next = stageOrder[currIdx + 1];
-      setStage(next);
-      if (next === "RESULT") setShowResultModal(true);
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: "stage_change", stage: next }));
-      }
+  function nextStage() {
+    const nxt = NEXT_STAGE[stageRef.current];
+    if (nxt) handleStageChange(nxt);
+  }
+
+  function endAll() {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
     }
-  };
-
-  const handleEndAll = () => {
-    if (currentAudioRef.current) currentAudioRef.current.pause();
     wsRef.current?.close();
     setConnected(false);
     setExamStarted(false);
     setActiveSpeaker(null);
     setShowResultModal(true);
-  };
+  }
 
-  const timeMin = Math.floor(timer / 60);
-  const timeSec = timer % 60;
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close();
+      micStreamRef.current?.getTracks().forEach((t) => t.stop());
+      audioContextRef.current?.close();
+    };
+  }, []);
+
+  const minutes = Math.floor(timer / 60);
+  const seconds = timer % 60;
+  const timerDisplay = `${minutes}:${seconds.toString().padStart(2, "0")}`;
+  const isMicDisabledUi = AUTO_ADVANCE_STAGES.includes(stage);
 
   return (
     <div className="min-h-screen bg-[#0a0d14] text-neutral-100 flex flex-col font-sans selection:bg-amber-500 selection:text-black">
-      {/* TOP BAR */}
+      {/* HEADER */}
       <header className="border-b border-neutral-800/80 bg-[#0d121c]/70 backdrop-blur-md px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center font-black text-black text-xs shadow-md shadow-amber-500/20">
             DE
           </div>
           <div>
-            <h1 className="text-sm font-bold tracking-tight text-white">Goethe / telc B1–B2 AI Simulator</h1>
-            <p className="text-[11px] text-neutral-400">Offizielle Prüfungsumgebung</p>
+            <h1 className="text-sm font-bold tracking-tight text-white leading-none">
+              German Speaking Exam
+            </h1>
+            <p className="text-[11px] text-neutral-400 mt-0.5">Powered by Cartesia + Groq</p>
           </div>
         </div>
 
-        {/* TIMER & STATUS */}
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2 bg-neutral-900/90 border border-neutral-800 px-3 py-1 rounded-full text-xs">
-            <span className={`w-2 h-2 rounded-full ${connected ? "bg-emerald-400 animate-pulse" : "bg-rose-500"}`} />
-            <span className="font-mono text-[11px] text-neutral-300">{connected ? "ONLINE" : "STANDBY"}</span>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 bg-neutral-900/90 border border-neutral-800 px-3 py-1.5 rounded-full text-xs">
+            <span
+              className={`w-2 h-2 rounded-full ${
+                connected ? "bg-emerald-400 animate-pulse" : "bg-rose-500"
+              }`}
+            />
+            <span className="font-mono text-[11px] text-neutral-300">
+              {connected ? "🟢 Live" : "🔴 Offline"}
+            </span>
           </div>
-
-          <div className="font-mono font-bold text-sm bg-neutral-900/90 border border-neutral-800 text-amber-400 px-3 py-1 rounded-lg">
-            {timeMin}:{timeSec.toString().padStart(2, "0")}
+          <div
+            className={`font-mono font-bold text-sm px-3 py-1.5 rounded-lg border transition-all ${
+              timer < 60
+                ? "bg-rose-950/40 border-rose-800/60 text-rose-400 animate-pulse"
+                : "bg-neutral-900/90 border-neutral-800 text-amber-400"
+            }`}
+          >
+            {timerDisplay}
           </div>
         </div>
       </header>
 
-      {/* STAGE STEPPER (Prep / Stage 1 / Stage 2 / Stage 3 / Evaluation) */}
-      <nav aria-label="Prüfungsfortschritt" className="bg-[#0b0f17] border-b border-neutral-800/60 px-6 py-2.5">
-        <div className="max-w-7xl mx-auto flex items-center justify-between overflow-x-auto text-xs">
-          {STAGES.map((stg, i) => {
+      {/* STAGE STEPPER */}
+      <nav aria-label="Exam Progress" className="bg-[#0b0f17] border-b border-neutral-800/60 px-6 py-2.5">
+        <div className="max-w-7xl mx-auto flex items-center justify-between overflow-x-auto text-xs gap-3">
+          {STAGE_DISPLAY_GROUPS.map((stg, i) => {
             const isActive = stage === stg.key;
             return (
-              <div key={stg.key} className="flex items-center gap-2 min-w-max cursor-pointer" onClick={() => setStage(stg.key)}>
+              <div
+                key={stg.key}
+                onClick={() => handleStageChange(stg.key)}
+                className="flex items-center gap-2 min-w-max cursor-pointer"
+              >
                 <div
                   className={`w-5 h-5 rounded-full flex items-center justify-center font-bold text-[10px] transition-all ${
                     isActive
@@ -321,35 +659,48 @@ export default function ExamPage() {
                   {i + 1}
                 </div>
                 <div className="flex flex-col">
-                  <span className={`font-semibold ${isActive ? "text-amber-400" : "text-neutral-300"}`}>{stg.label}</span>
+                  <span
+                    className={`font-semibold ${
+                      isActive ? "text-amber-400" : "text-neutral-300"
+                    }`}
+                  >
+                    {stg.label}
+                  </span>
                   <span className="text-[9px] text-neutral-500 hidden sm:block">{stg.sub}</span>
                 </div>
-                {i < STAGES.length - 1 && <span className="text-neutral-700 mx-3">/</span>}
+                {i < STAGE_DISPLAY_GROUPS.length - 1 && (
+                  <span className="text-neutral-700 mx-2">/</span>
+                )}
               </div>
             );
           })}
         </div>
       </nav>
 
-      {/* MAIN 3-PANEL LAYOUT MATCHING WIREFRAME SKETCH */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-12 gap-5">
-        
-        {/* LEFT COLUMN: 3 PARTICIPANTS VIRTUAL EXAM TABLE (5 Cols) */}
-        <section aria-labelledby="stage-participants-title" className="lg:col-span-5 flex flex-col justify-between bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl p-5 shadow-2xl relative overflow-hidden backdrop-blur-sm">
+        {/* LEFT COLUMN: PARTICIPANTS (5 Cols) */}
+        <section
+          aria-labelledby="participants-title"
+          className="lg:col-span-5 flex flex-col justify-between bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl p-5 shadow-2xl backdrop-blur-sm"
+        >
           <div className="flex items-center justify-between border-b border-neutral-800/60 pb-3 mb-2">
-            <h2 id="stage-participants-title" className="text-xs font-semibold uppercase tracking-wider text-neutral-400">
+            <h2
+              id="participants-title"
+              className="text-xs font-semibold uppercase tracking-wider text-neutral-400"
+            >
               Prüfungsraum &bull; Teilnehmer
             </h2>
             <span className="text-[11px] font-mono text-amber-400/90">{status}</span>
           </div>
 
-          {/* TOP ROW: CANDIDATE A (ME) & CANDIDATE B (PARTNER) */}
           <div className="grid grid-cols-2 gap-4 my-2">
-            {/* ME (CANDIDATE A) */}
+            {/* ME */}
             <div
-              className={`relative rounded-xl p-4 border transition-all duration-300 flex flex-col items-center text-center ${
+              className={`rounded-xl p-4 border transition-all duration-300 flex flex-col items-center text-center ${
                 activeSpeaker === "user"
                   ? "bg-emerald-950/20 border-emerald-500/80 shadow-lg shadow-emerald-500/10 ring-2 ring-emerald-500/30"
+                  : isMicDisabledUi
+                  ? "bg-neutral-950 border-neutral-900 opacity-60"
                   : "bg-neutral-900/60 border-neutral-800/80"
               }`}
             >
@@ -357,6 +708,8 @@ export default function ExamPage() {
                 className={`w-14 h-14 rounded-2xl flex items-center justify-center font-bold text-lg mb-2 transition-all ${
                   activeSpeaker === "user"
                     ? "bg-emerald-500 text-black scale-105 shadow-md shadow-emerald-500/30"
+                    : isMicDisabledUi
+                    ? "bg-neutral-900 text-neutral-600 border border-neutral-800"
                     : "bg-neutral-800 text-neutral-300 border border-neutral-700"
                 }`}
               >
@@ -364,13 +717,13 @@ export default function ExamPage() {
               </div>
               <h3 className="text-xs font-bold text-white">Sie (Kandidat A)</h3>
               <p className="text-[10px] text-emerald-400/90 font-mono mt-0.5">
-                {activeSpeaker === "user" ? "Spricht gerade..." : "Bereit"}
+                {activeSpeaker === "user" ? "Spricht..." : isMicDisabledUi ? "Stumm (Zuhören)" : "Bereit"}
               </p>
             </div>
 
-            {/* CANDIDATE B (PARTNER) */}
+            {/* CANDIDATE B */}
             <div
-              className={`relative rounded-xl p-4 border transition-all duration-300 flex flex-col items-center text-center ${
+              className={`rounded-xl p-4 border transition-all duration-300 flex flex-col items-center text-center ${
                 activeSpeaker === "partner"
                   ? "bg-indigo-950/20 border-indigo-500/80 shadow-lg shadow-indigo-500/10 ring-2 ring-indigo-500/30"
                   : "bg-neutral-900/60 border-neutral-800/80"
@@ -385,14 +738,14 @@ export default function ExamPage() {
               >
                 B
               </div>
-              <h3 className="text-xs font-bold text-white">Lukas (Kandidat B)</h3>
+              <h3 className="text-xs font-bold text-white">Josh (Kandidat B)</h3>
               <p className="text-[10px] text-indigo-400/90 font-mono mt-0.5">
-                {activeSpeaker === "partner" ? "Diskutiert..." : "Hört zu"}
+                {activeSpeaker === "partner" ? "Spricht..." : "Hört zu"}
               </p>
             </div>
           </div>
 
-          {/* BOTTOM ROW: EXAMINER (DR. WEBER) IN CENTER */}
+          {/* EXAMINER (DR. RACHEL) IN CENTER */}
           <div className="flex justify-center my-2">
             <div
               className={`w-full max-w-[280px] rounded-xl p-4 border transition-all duration-300 flex flex-col items-center text-center ${
@@ -410,9 +763,11 @@ export default function ExamPage() {
               >
                 Prüfer
               </div>
-              <h3 className="text-xs font-bold text-white">Dr. Weber (Prüfer)</h3>
+              <h3 className="text-xs font-bold text-white">Rachel (Prüferin)</h3>
               <p className="text-[10px] text-amber-400/90 font-mono mt-0.5">
-                {activeSpeaker === "examiner" ? "Leitet die Prüfung..." : "Beobachtet & bewertet"}
+                {activeSpeaker === "examiner"
+                  ? "Spricht..."
+                  : "Beobachtet & bewertet"}
               </p>
             </div>
           </div>
@@ -429,39 +784,47 @@ export default function ExamPage() {
             ))}
           </div>
 
-          {/* ACTION BUTTONS (Next / End All) */}
+          {/* ACTION BUTTONS */}
           <div className="grid grid-cols-2 gap-3 pt-3 border-t border-neutral-800/60 mt-2">
             {!examStarted ? (
               <button
-                onClick={handleStartExam}
+                onClick={startExam}
                 className="col-span-2 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black font-extrabold py-3 rounded-xl text-xs shadow-lg shadow-emerald-500/20 transition-all uppercase tracking-wider"
               >
-                Prüfung starten &bull; Start Exam
+                🎓 Start Exam
               </button>
             ) : (
               <>
                 <button
-                  onClick={handleNextStage}
-                  className="bg-neutral-800 hover:bg-neutral-700 text-white font-bold py-2.5 rounded-xl text-xs border border-neutral-700 transition-all"
+                  onClick={nextStage}
+                  disabled={stage === "RESULT" || !connected}
+                  className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 text-white font-bold py-2.5 rounded-xl text-xs border border-neutral-700 transition-all"
                 >
-                  Next Stage &rarr;
+                  Skip to Next &rarr;
                 </button>
                 <button
-                  onClick={handleEndAll}
-                  className="bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 font-bold py-2.5 rounded-xl text-xs border border-rose-800/50 transition-all"
+                  onClick={endAll}
+                  disabled={!connected}
+                  className="bg-rose-950/40 hover:bg-rose-900/60 disabled:opacity-40 text-rose-300 font-bold py-2.5 rounded-xl text-xs border border-rose-800/50 transition-all"
                 >
-                  End All &#10005;
+                  End Call &#10005;
                 </button>
               </>
             )}
           </div>
         </section>
 
-        {/* MIDDLE COLUMN: EXAM TOPICS (Aufgabenkarte) (4 Cols) */}
-        <section aria-labelledby="exam-topics-title" className="lg:col-span-4 flex flex-col bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl p-5 shadow-2xl backdrop-blur-sm overflow-y-auto">
+        {/* MIDDLE COLUMN: EXAM TOPICS (4 Cols) */}
+        <section
+          aria-labelledby="topics-title"
+          className="lg:col-span-4 flex flex-col bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl p-5 shadow-2xl backdrop-blur-sm overflow-y-auto"
+        >
           <div className="border-b border-neutral-800/60 pb-3 mb-4 flex items-center justify-between">
-            <h2 id="exam-topics-title" className="text-xs font-semibold uppercase tracking-wider text-amber-400">
-              Exam Topics (Themen)
+            <h2
+              id="topics-title"
+              className="text-xs font-semibold uppercase tracking-wider text-amber-400"
+            >
+              Exam Topics
             </h2>
             <span className="text-[10px] bg-neutral-800 px-2 py-0.5 rounded text-neutral-400 font-mono">
               B1 / B2
@@ -469,75 +832,131 @@ export default function ExamPage() {
           </div>
 
           <div className="space-y-3.5">
-            {TOPICS.map((t, idx) => {
-              const isCurrent = stage === t.stage;
-              return (
-                <div
-                  key={idx}
-                  className={`rounded-xl p-3.5 border transition-all ${
-                    isCurrent
-                      ? "bg-amber-950/20 border-amber-500/70 shadow-md shadow-amber-500/10"
-                      : "bg-neutral-900/40 border-neutral-800/60 opacity-60"
-                  }`}
-                >
-                  <div className="flex items-center justify-between mb-1.5">
-                    <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-neutral-800 text-amber-300 font-bold">
-                      {t.badge}
-                    </span>
-                    {isCurrent && (
-                      <span className="text-[10px] text-emerald-400 font-bold tracking-wider animate-pulse">
-                        AKTIV
-                      </span>
-                    )}
-                  </div>
-                  <h3 className="text-xs font-bold text-white mb-2">{t.title}</h3>
-                  <ul className="space-y-1.5">
-                    {t.bullets.map((b, bIdx) => (
-                      <li key={bIdx} className="text-[11px] text-neutral-300 flex items-start gap-1.5">
-                        <span className="w-1 h-1 rounded-full bg-amber-400 mt-1.5 shrink-0" />
-                        <span>{b}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              );
-            })}
+            <div
+              className={`rounded-xl p-3.5 border transition-all ${
+                stage === "USER_PRESENTATION" || stage === "USER_QA"
+                  ? "bg-amber-950/20 border-amber-500/70 shadow-md shadow-amber-500/10"
+                  : "bg-neutral-900/40 border-neutral-800/60 opacity-80"
+              }`}
+            >
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-neutral-800 text-amber-300 font-bold">
+                  Speech 1
+                </span>
+                {(stage === "USER_PRESENTATION" || stage === "USER_QA") && (
+                  <span className="text-[10px] text-emerald-400 font-bold tracking-wider animate-pulse">
+                    AKTIV
+                  </span>
+                )}
+              </div>
+              <h3 className="text-xs font-bold text-white mb-1">{topics.speech1}</h3>
+              <p className="text-[11px] text-neutral-400">
+                Beschreiben Sie persönliche Erfahrungen, Vor- und Nachteile sowie ein Fazit.
+              </p>
+            </div>
+
+            <div
+              className={`rounded-xl p-3.5 border transition-all ${
+                stage === "PARTNER_PRESENTATION" || stage === "PARTNER_QA"
+                  ? "bg-indigo-950/20 border-indigo-500/70 shadow-md shadow-indigo-500/10"
+                  : "bg-neutral-900/40 border-neutral-800/60 opacity-80"
+              }`}
+            >
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-neutral-800 text-indigo-300 font-bold">
+                  Speech 2
+                </span>
+                {(stage === "PARTNER_PRESENTATION" || stage === "PARTNER_QA") && (
+                  <span className="text-[10px] text-indigo-400 font-bold tracking-wider animate-pulse">
+                    AKTIV
+                  </span>
+                )}
+              </div>
+              <h3 className="text-xs font-bold text-white mb-1">{topics.speech2}</h3>
+              <p className="text-[11px] text-neutral-400">
+                Hören Sie der Präsentation Ihres Partners zu und stellen Sie Rückfragen.
+              </p>
+            </div>
+
+            <div
+              className={`rounded-xl p-3.5 border transition-all ${
+                stage === "DEBATE"
+                  ? "bg-amber-950/20 border-amber-500/70 shadow-md shadow-amber-500/10"
+                  : "bg-neutral-900/40 border-neutral-800/60 opacity-80"
+              }`}
+            >
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-neutral-800 text-amber-300 font-bold">
+                  Debate
+                </span>
+                {stage === "DEBATE" && (
+                  <span className="text-[10px] text-emerald-400 font-bold tracking-wider animate-pulse">
+                    AKTIV
+                  </span>
+                )}
+              </div>
+              <h3 className="text-xs font-bold text-white mb-1">{topics.debate}</h3>
+              <p className="text-[11px] text-neutral-400">
+                Diskutieren Sie gemeinsam und einigen Sie sich auf einen Kompromiss.
+              </p>
+            </div>
           </div>
         </section>
 
-        {/* RIGHT COLUMN: LIVE CONVERSATION TRANSCRIPT (3 Cols) */}
-        <section aria-labelledby="live-transcript-title" className="lg:col-span-3 flex flex-col bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl shadow-2xl backdrop-blur-sm overflow-hidden h-[580px] lg:h-auto">
+        {/* RIGHT COLUMN: LIVE CONVERSATION (3 Cols) */}
+        <section
+          aria-labelledby="transcript-header"
+          className="lg:col-span-3 flex flex-col bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl shadow-2xl backdrop-blur-sm overflow-hidden h-[580px] lg:h-auto"
+        >
           <div className="border-b border-neutral-800/60 px-4 py-3 bg-neutral-900/40 flex items-center justify-between">
-            <h2 id="live-transcript-title" className="text-xs font-semibold uppercase tracking-wider text-neutral-300">
-              Live Transcript
+            <h2
+              id="transcript-header"
+              className="text-xs font-semibold uppercase tracking-wider text-neutral-300"
+            >
+              Live Conversation
             </h2>
             <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded">
               REC
             </span>
           </div>
 
-          {/* LIVE CHAT FEED */}
           <div className="flex-1 p-3.5 overflow-y-auto space-y-3 text-xs">
             {messages.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-center text-neutral-500 p-4">
-                <p className="text-[11px]">Das Live-Protokoll startet, sobald die Prüfung beginnt.</p>
+                <p className="text-[11px]">Start exam to begin...</p>
               </div>
             ) : (
               messages.map((m) => {
+                if (m.sender === "system") {
+                  return (
+                    <div
+                      key={m.id}
+                      className="py-1 text-center font-mono text-[10px] text-amber-400/80 uppercase tracking-wider"
+                    >
+                      {m.text}
+                    </div>
+                  );
+                }
+
                 const isUser = m.sender === "user";
                 const isExaminer = m.sender === "examiner";
+
                 return (
-                  <div key={m.id} className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}>
+                  <div
+                    key={m.id}
+                    className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}
+                  >
                     <span className="text-[9px] text-neutral-400 mb-0.5 font-mono">
-                      {isUser ? "Sie (A)" : isExaminer ? "Dr. Weber" : "Lukas (B)"} &bull; {m.time}
+                      {isUser ? "YOU" : isExaminer ? "EXAMINER (Rachel)" : "PARTNER (Josh)"} &bull;{" "}
+                      {m.time}
                     </span>
                     <div
                       className={`max-w-[90%] rounded-xl p-2.5 text-[11px] leading-relaxed ${
                         isUser
-                          ? "bg-emerald-950/30 text-emerald-100 border border-emerald-800/40"
+                          ? "bg-neutral-800 text-neutral-100 border border-neutral-700"
                           : isExaminer
-                          ? "bg-amber-950/30 text-amber-100 border border-amber-800/40"
-                          : "bg-indigo-950/30 text-indigo-100 border border-indigo-800/40"
+                          ? "bg-blue-950/50 text-blue-100 border border-blue-800/50"
+                          : "bg-purple-950/50 text-purple-100 border border-purple-800/50"
                       }`}
                     >
                       {m.text}
@@ -551,7 +970,7 @@ export default function ExamPage() {
         </section>
       </main>
 
-      {/* EVALUATION / SCORE MODAL */}
+      {/* RESULT MODAL */}
       {showResultModal && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
           <div className="bg-[#0e131f] border border-neutral-700 max-w-md w-full rounded-2xl p-6 shadow-2xl">
@@ -564,7 +983,10 @@ export default function ExamPage() {
                 { k: "Formale Richtigkeit (Grammar)", v: "7.5 / 10" },
                 { k: "Aussprache (Pronunciation)", v: "8.0 / 10" },
               ].map((item, i) => (
-                <div key={i} className="flex justify-between p-2.5 bg-neutral-900/60 rounded-lg text-xs border border-neutral-800">
+                <div
+                  key={i}
+                  className="flex justify-between p-2.5 bg-neutral-900/60 rounded-lg text-xs border border-neutral-800"
+                >
                   <span className="text-neutral-300">{item.k}</span>
                   <span className="font-mono font-bold text-amber-400">{item.v}</span>
                 </div>
