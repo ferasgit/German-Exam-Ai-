@@ -330,8 +330,7 @@ export default function ExamPage() {
           if (msg.type === "audio_mp3") {
             const speakerRole =
               msg.speaker === "partner" ||
-              stageRef.current === "PARTNER_PRESENTATION" ||
-              stageRef.current === "PARTNER_QA"
+              ["USER_QA", "PARTNER_PRESENTATION", "PARTNER_QA", "DEBATE"].includes(stageRef.current)
                 ? "partner"
                 : "examiner";
             setActiveSpeaker(speakerRole);
@@ -341,8 +340,7 @@ export default function ExamPage() {
           if (msg.type === "transcript_ai") {
             const isPartner =
               msg.speaker === "partner" ||
-              stageRef.current === "PARTNER_PRESENTATION" ||
-              stageRef.current === "PARTNER_QA";
+              ["USER_QA", "PARTNER_PRESENTATION", "PARTNER_QA", "DEBATE"].includes(stageRef.current);
 
             setMessages((prev) => [
               ...prev,
@@ -623,7 +621,7 @@ export default function ExamPage() {
               }`}
             />
             <span className="font-mono text-[11px] text-neutral-300">
-              {connected ? "🟢 Live" : "🔴 Offline"}
+              {connected ? " Live" : " Offline"}
             </span>
           </div>
           <div
