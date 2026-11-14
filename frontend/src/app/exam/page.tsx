@@ -34,8 +34,6 @@ const NEXT_STAGE: Record<ExamStage, ExamStage | null> = {
   RESULT: null,
 };
 
-// The stages where the user is just listening to the AI. 
-// Mic is disabled, and it auto-advances when the AI finishes speaking.
 const AUTO_ADVANCE_STAGES: ExamStage[] = ["PREPARATION", "INTRO", "PARTNER_PRESENTATION"];
 
 const STAGE_DISPLAY_GROUPS: { key: ExamStage; label: string; sub: string }[] = [
@@ -56,6 +54,7 @@ const MIN_THRESHOLD = 22;
 const IDLE_RESTART_MS = 3000;
 const AFTER_AI_IGNORE_MS = 700;
 
+// FIX 1: Dynamic WS URL for secure wss:// in production
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8787/voice";
 
 export default function ExamPage() {
@@ -65,6 +64,7 @@ export default function ExamPage() {
   const [messages, setMessages] = useState<
     { id: string; sender: "examiner" | "partner" | "user" | "system"; text: string; time: string }[]
   >([]);
+  
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [examStarted, setExamStarted] = useState(false);
@@ -72,6 +72,10 @@ export default function ExamPage() {
   const [audioLevel, setAudioLevel] = useState(0);
   const [activeSpeaker, setActiveSpeaker] = useState<"examiner" | "partner" | "user" | null>(null);
   const [showResultModal, setShowResultModal] = useState(false);
+  
+  // FIX 2: Busy State to prevent Race Conditions
+  const [isAiBusy, setIsAiBusy] = useState(false); 
+  const [examEvaluation, setExamEvaluation] = useState<any>(null); // Stores real backend result
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -93,7 +97,6 @@ export default function ExamPage() {
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   
-  // Ref to safely call handleStageChange inside callbacks without dependency cycles
   const handleStageChangeRef = useRef<((s: ExamStage) => void) | null>(null);
 
   useEffect(() => {
@@ -111,22 +114,29 @@ export default function ExamPage() {
   const topics = {
     speech1: "Beschreiben Sie Ihre Heimatstadt.",
     speech2: "Sollte Online-Lernen Schulen ersetzen?",
-    debate: "Sollten soziale Medien fur Jugendliche begrenzt werden?",
+    debate: "Sollten soziale Medien für Jugendliche begrenzt werden?",
   };
 
   // =========================
-  // TIMER MECHANISM
+  // FIX 3: ENFORCED TIMER LOGIC
   // =========================
   useEffect(() => {
     if (!examStarted) return;
     let left = STAGE_SECONDS[stage];
     setTimer(left);
     if (left <= 0) return;
+    
     const interval = setInterval(() => {
       left -= 1;
       setTimer(left);
       if (left <= 0) {
         clearInterval(interval);
+        // Force audio to stop when time is up
+        if (currentAudioRef.current) {
+          currentAudioRef.current.pause();
+          currentAudioRef.current = null;
+        }
+        setIsAiBusy(false);
         const nxt = NEXT_STAGE[stageRef.current];
         if (nxt && handleStageChangeRef.current) handleStageChangeRef.current(nxt);
       }
@@ -134,9 +144,6 @@ export default function ExamPage() {
     return () => clearInterval(interval);
   }, [examStarted, stage]);
 
-  // =========================
-  // RESTART RECORDER
-  // =========================
   const restartRecorder = useCallback(async () => {
     if (recorderBusyRef.current || !micStreamRef.current) return;
     recorderBusyRef.current = true;
@@ -159,9 +166,6 @@ export default function ExamPage() {
     }
   }, []);
 
-  // =========================
-  // PLAY MP3 AUDIO & AUTO-ADVANCE LOGIC
-  // =========================
   const playAudioMp3 = useCallback(
     async (base64: string) => {
       try {
@@ -200,10 +204,10 @@ export default function ExamPage() {
           isSpeakingRef.current = false;
           setActiveSpeaker(null);
           interruptSentRef.current = false;
+          setIsAiBusy(false); // AI finished speaking, unlock UI
 
           const currentStg = stageRef.current;
           
-          // AUTO-ADVANCE LOGIC: If we are in Prep, Intro, or Partner Presentation, jump to next stage automatically!
           if (AUTO_ADVANCE_STAGES.includes(currentStg)) {
             setStatus("AI finished. Auto-advancing...");
             setTimeout(() => {
@@ -211,9 +215,8 @@ export default function ExamPage() {
               if (nxt && handleStageChangeRef.current) {
                 handleStageChangeRef.current(nxt);
               }
-            }, 1200); // 1.2 second pause before jumping to next stage
+            }, 1200);
           } else {
-            // Normal behavior: turn the user's mic back on
             setStatus("Listening... speak now 🎤");
             ignoreUntilRef.current = performance.now() + AFTER_AI_IGNORE_MS;
             setTimeout(() => {
@@ -227,6 +230,7 @@ export default function ExamPage() {
           currentAudioRef.current = null;
           setIsSpeaking(false);
           isSpeakingRef.current = false;
+          setIsAiBusy(false);
           setActiveSpeaker(null);
         };
 
@@ -237,17 +241,15 @@ export default function ExamPage() {
         isPlayingRef.current = false;
         setIsSpeaking(false);
         isSpeakingRef.current = false;
+        setIsAiBusy(false);
         setActiveSpeaker(null);
       }
     },
     [restartRecorder]
   );
 
-  // =========================
-  // PROCESS SPEECH
-  // =========================
   const processSpeech = useCallback(async () => {
-    if (isSpeakingRef.current || !mediaRecorderRef.current) return;
+    if (isSpeakingRef.current || !mediaRecorderRef.current || isAiBusy) return;
 
     const voicedMs = voicedMsRef.current;
     voicedMsRef.current = 0;
@@ -281,14 +283,12 @@ export default function ExamPage() {
 
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       setStatus("Processing speech...");
+      setIsAiBusy(true); // Lock the UI while waiting for Groq/Cartesia
       const arrayBuffer = await audioBlob.arrayBuffer();
       wsRef.current.send(arrayBuffer);
     }
-  }, []);
+  }, [isAiBusy]);
 
-  // =========================
-  // CONNECT WEBSOCKET
-  // =========================
   const connectWS = useCallback(
     async (currentStage: ExamStage) => {
       if (wsRef.current) {
@@ -325,6 +325,7 @@ export default function ExamPage() {
 
           if (msg.type === "processing") {
             setStatus("AI thinking...");
+            setIsAiBusy(true);
           }
 
           if (msg.type === "audio_mp3") {
@@ -335,6 +336,27 @@ export default function ExamPage() {
                 : "examiner";
             setActiveSpeaker(speakerRole);
             await playAudioMp3(msg.data as string);
+          }
+
+          // FIX 4: Real Backend Scoring Integration
+          if (msg.type === "exam_result") {
+            setExamEvaluation(msg.data);
+            setShowResultModal(true);
+            
+            // Format the transcript for Admin dashboard demo sync
+            const formattedTranscript = messages.map((m) => ({
+              speaker: m.sender === "user" ? "STUDENT" : m.sender === "examiner" ? "EXAMINER (Rachel)" : "PARTNER (Josh)",
+              text: m.text,
+            }));
+
+            // Pass the REAL data to local storage so the admin panel matches perfectly
+            const examResult = {
+              lastScore: msg.data.score || 0, 
+              cefrBreakdown: msg.data.breakdown || { pronunciation: 0, grammar: 0, vocabulary: 0, taskCompletion: 0 },
+              weakness: msg.data.weakness || "Pending review",
+              recentTranscript: formattedTranscript,
+            };
+            localStorage.setItem("demoExamResult", JSON.stringify(examResult));
           }
 
           if (msg.type === "transcript_ai") {
@@ -373,14 +395,16 @@ export default function ExamPage() {
             isPlayingRef.current = false;
             setIsSpeaking(false);
             isSpeakingRef.current = false;
+            setIsAiBusy(false);
             setActiveSpeaker(null);
             interruptSentRef.current = false;
             setStatus("Listening... 🎤");
           }
 
           if (msg.type === "error") {
-            console.warn("Backend:", msg.message);
+            console.warn("Backend Error Handled");
             setStatus("Network problem — please speak again 🎤");
+            setIsAiBusy(false);
           }
         } catch (err) {
           console.error("WS message error:", err);
@@ -394,12 +418,9 @@ export default function ExamPage() {
 
       ws.onerror = () => setStatus("Connection error");
     },
-    [playAudioMp3]
+    [playAudioMp3, messages]
   );
 
-  // =========================
-  // MIC WITH ORIGINAL ACCURATE VAD
-  // =========================
   const startMic = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -442,8 +463,14 @@ export default function ExamPage() {
         const dt = now - lastFrameRef.current;
         lastFrameRef.current = now;
         
-        // AUTO MUTING LOGIC: If in stage 1, 2, or 5, the mic ignores all noise entirely!
-        const isMicDisabled = AUTO_ADVANCE_STAGES.includes(stageRef.current);
+        const isMicDisabled = AUTO_ADVANCE_STAGES.includes(stageRef.current) || isAiBusy;
+        
+        // FIX 5: Audio Buffer Memory Leak
+        // Continuously empty recording chunks if the user is not supposed to be speaking
+        if (isMicDisabled) {
+          audioChunksRef.current = [];
+        }
+
         const busy = isSpeakingRef.current || now < ignoreUntilRef.current || isMicDisabled;
 
         if (!busy && !speechDetectedRef.current) {
@@ -451,27 +478,6 @@ export default function ExamPage() {
         }
         const threshold = Math.max(MIN_THRESHOLD, noiseFloorRef.current * 1.8 + SPEECH_MARGIN);
         const loud = volume > threshold;
-
-        if (
-          ALLOW_BARGE_IN &&
-          volume > 25 &&
-          isPlayingRef.current &&
-          !interruptSentRef.current &&
-          !AUTO_ADVANCE_STAGES.includes(stageRef.current)
-        ) {
-          interruptSentRef.current = true;
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({ type: "interrupt" }));
-          }
-          if (currentAudioRef.current) {
-            currentAudioRef.current.pause();
-            currentAudioRef.current = null;
-          }
-          isPlayingRef.current = false;
-          setIsSpeaking(false);
-          isSpeakingRef.current = false;
-          setStatus("Listening... 🎤");
-        }
 
         if (loud && !busy) {
           voicedMsRef.current += dt;
@@ -511,18 +517,15 @@ export default function ExamPage() {
       requestAnimationFrame(checkVAD);
     } catch (err) {
       console.error("Mic error:", err);
-      setStatus("Microphone error");
+      setStatus("Microphone access denied or error");
     }
-  }, [processSpeech, restartRecorder]);
+  }, [processSpeech, restartRecorder, isAiBusy]);
 
-  // =========================
-  // STAGE HANDLERS
-  // =========================
   function handleStageChange(newStage: ExamStage) {
     setStage(newStage);
     stageRef.current = newStage;
+    setIsAiBusy(false);
     
-    // Update status to reflect if mic is disabled in the new stage
     if (AUTO_ADVANCE_STAGES.includes(newStage)) {
       setStatus("Nur Zuhören (AI speaking)");
     } else {
@@ -530,8 +533,11 @@ export default function ExamPage() {
     }
 
     if (newStage === "RESULT") {
-      setShowResultModal(true);
+      // Backend will now calculate and send the real result via WebSocket msg.type="exam_result"
+      setStatus("Analyzing final score...");
+      setIsAiBusy(true); 
     }
+
     if (currentAudioRef.current) {
       currentAudioRef.current.pause();
       currentAudioRef.current = null;
@@ -557,7 +563,6 @@ export default function ExamPage() {
     }
   }
 
-  // Bind function to ref so callbacks can use it safely
   handleStageChangeRef.current = handleStageChange;
 
   async function startExam() {
@@ -568,6 +573,7 @@ export default function ExamPage() {
   }
 
   function nextStage() {
+    if (isAiBusy) return; // Block skip if AI is thinking/speaking
     const nxt = NEXT_STAGE[stageRef.current];
     if (nxt) handleStageChange(nxt);
   }
@@ -581,6 +587,13 @@ export default function ExamPage() {
     setConnected(false);
     setExamStarted(false);
     setActiveSpeaker(null);
+    
+    // In an emergency cancel, just show a generic closed modal
+    setExamEvaluation({
+      score: 0,
+      breakdown: { pronunciation: 0, grammar: 0, vocabulary: 0, taskCompletion: 0 },
+      weakness: "Exam ended early."
+    });
     setShowResultModal(true);
   }
 
@@ -595,7 +608,7 @@ export default function ExamPage() {
   const minutes = Math.floor(timer / 60);
   const seconds = timer % 60;
   const timerDisplay = `${minutes}:${seconds.toString().padStart(2, "0")}`;
-  const isMicDisabledUi = AUTO_ADVANCE_STAGES.includes(stage);
+  const isMicDisabledUi = AUTO_ADVANCE_STAGES.includes(stage) || isAiBusy;
 
   return (
     <div className="min-h-screen bg-[#0a0d14] text-neutral-100 flex flex-col font-sans selection:bg-amber-500 selection:text-black">
@@ -607,9 +620,9 @@ export default function ExamPage() {
           </div>
           <div>
             <h1 className="text-sm font-bold tracking-tight text-white leading-none">
-              German Speaking Exam
+              German Practice Exam
             </h1>
-            <p className="text-[11px] text-neutral-400 mt-0.5">Powered by Cartesia + Groq</p>
+            <p className="text-[11px] text-neutral-400 mt-0.5">Unofficial AI Training Environment</p>
           </div>
         </div>
 
@@ -644,8 +657,8 @@ export default function ExamPage() {
             return (
               <div
                 key={stg.key}
-                onClick={() => handleStageChange(stg.key)}
-                className="flex items-center gap-2 min-w-max cursor-pointer"
+                onClick={() => { if(!isAiBusy) handleStageChange(stg.key) }}
+                className={`flex items-center gap-2 min-w-max ${isAiBusy ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
               >
                 <div
                   className={`w-5 h-5 rounded-full flex items-center justify-center font-bold text-[10px] transition-all ${
@@ -676,16 +689,9 @@ export default function ExamPage() {
       </nav>
 
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* LEFT COLUMN: PARTICIPANTS (5 Cols) */}
-        <section
-          aria-labelledby="participants-title"
-          className="lg:col-span-5 flex flex-col justify-between bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl p-5 shadow-2xl backdrop-blur-sm"
-        >
+        <section className="lg:col-span-5 flex flex-col justify-between bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl p-5 shadow-2xl backdrop-blur-sm">
           <div className="flex items-center justify-between border-b border-neutral-800/60 pb-3 mb-2">
-            <h2
-              id="participants-title"
-              className="text-xs font-semibold uppercase tracking-wider text-neutral-400"
-            >
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-neutral-400">
               Prüfungsraum &bull; Teilnehmer
             </h2>
             <span className="text-[11px] font-mono text-amber-400/90">{status}</span>
@@ -743,7 +749,7 @@ export default function ExamPage() {
             </div>
           </div>
 
-          {/* EXAMINER (DR. RACHEL) IN CENTER */}
+          {/* EXAMINER */}
           <div className="flex justify-center my-2">
             <div
               className={`w-full max-w-[280px] rounded-xl p-4 border transition-all duration-300 flex flex-col items-center text-center ${
@@ -795,8 +801,8 @@ export default function ExamPage() {
               <>
                 <button
                   onClick={nextStage}
-                  disabled={stage === "RESULT" || !connected}
-                  className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 text-white font-bold py-2.5 rounded-xl text-xs border border-neutral-700 transition-all"
+                  disabled={stage === "RESULT" || !connected || isAiBusy}
+                  className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold py-2.5 rounded-xl text-xs border border-neutral-700 transition-all"
                 >
                   Skip to Next &rarr;
                 </button>
@@ -812,16 +818,10 @@ export default function ExamPage() {
           </div>
         </section>
 
-        {/* MIDDLE COLUMN: EXAM TOPICS (4 Cols) */}
-        <section
-          aria-labelledby="topics-title"
-          className="lg:col-span-4 flex flex-col bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl p-5 shadow-2xl backdrop-blur-sm overflow-y-auto"
-        >
+        {/* MIDDLE COLUMN: EXAM TOPICS */}
+        <section className="lg:col-span-4 flex flex-col bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl p-5 shadow-2xl backdrop-blur-sm overflow-y-auto">
           <div className="border-b border-neutral-800/60 pb-3 mb-4 flex items-center justify-between">
-            <h2
-              id="topics-title"
-              className="text-xs font-semibold uppercase tracking-wider text-amber-400"
-            >
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-amber-400">
               Exam Topics
             </h2>
             <span className="text-[10px] bg-neutral-800 px-2 py-0.5 rounded text-neutral-400 font-mono">
@@ -901,16 +901,10 @@ export default function ExamPage() {
           </div>
         </section>
 
-        {/* RIGHT COLUMN: LIVE CONVERSATION (3 Cols) */}
-        <section
-          aria-labelledby="transcript-header"
-          className="lg:col-span-3 flex flex-col bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl shadow-2xl backdrop-blur-sm overflow-hidden h-[580px] lg:h-auto"
-        >
+        {/* RIGHT COLUMN: LIVE CONVERSATION */}
+        <section className="lg:col-span-3 flex flex-col bg-[#0e131f]/80 border border-neutral-800/80 rounded-2xl shadow-2xl backdrop-blur-sm overflow-hidden h-[580px] lg:h-auto">
           <div className="border-b border-neutral-800/60 px-4 py-3 bg-neutral-900/40 flex items-center justify-between">
-            <h2
-              id="transcript-header"
-              className="text-xs font-semibold uppercase tracking-wider text-neutral-300"
-            >
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-neutral-300">
               Live Conversation
             </h2>
             <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded">
@@ -968,18 +962,18 @@ export default function ExamPage() {
         </section>
       </main>
 
-      {/* RESULT MODAL */}
+      {/* COMPLIANT RESULT MODAL */}
       {showResultModal && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
           <div className="bg-[#0e131f] border border-neutral-700 max-w-md w-full rounded-2xl p-6 shadow-2xl">
-            <h2 className="text-lg font-bold text-white mb-1">Goethe B1 Prüfungsbewertung</h2>
-            <p className="text-xs text-neutral-400 mb-4">Offizielles Zertifikats-Ergebnis</p>
+            <h2 className="text-lg font-bold text-white mb-1">B1 Practice Exam Result</h2>
+            <p className="text-xs text-neutral-400 mb-4">AI Evaluation Estimate</p>
             <div className="space-y-2.5 mb-5">
               {[
-                { k: "Wortschatz (Vocabulary)", v: "8.5 / 10" },
-                { k: "Aufgabenerfüllung (Task)", v: "9.0 / 10" },
-                { k: "Formale Richtigkeit (Grammar)", v: "7.5 / 10" },
-                { k: "Aussprache (Pronunciation)", v: "8.0 / 10" },
+                { k: "Wortschatz (Vocabulary)", v: `${examEvaluation?.breakdown?.vocabulary || 0} / 10` },
+                { k: "Aufgabenerfüllung (Task)", v: `${examEvaluation?.breakdown?.taskCompletion || 0} / 10` },
+                { k: "Formale Richtigkeit (Grammar)", v: `${examEvaluation?.breakdown?.grammar || 0} / 10` },
+                { k: "Aussprache (Pronunciation)", v: `${examEvaluation?.breakdown?.pronunciation || 0} / 10` },
               ].map((item, i) => (
                 <div
                   key={i}
@@ -991,7 +985,9 @@ export default function ExamPage() {
               ))}
             </div>
             <div className="flex items-center justify-between border-t border-neutral-800 pt-3">
-              <span className="text-sm font-bold text-emerald-400">BESTANDEN (33 / 40)</span>
+              <span className={`text-sm font-bold ${examEvaluation?.score >= 24 ? "text-emerald-400" : "text-rose-400"}`}>
+                {examEvaluation?.score >= 24 ? "BESTANDEN" : "NICHT BESTANDEN"} ({examEvaluation?.score || 0} / 40)
+              </span>
               <button
                 onClick={() => setShowResultModal(false)}
                 className="bg-neutral-800 hover:bg-neutral-700 text-white px-4 py-2 rounded-lg text-xs font-semibold"
