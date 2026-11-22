@@ -5,6 +5,8 @@ import "dotenv/config";
 import dns from "node:dns";
 import net from "node:net";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { pickTopics, resolveTopics } from "./topics.ts";
+import type { ExamTopics } from "./topics.ts";
 
 // WSL network fix: prefer IPv4 and give each connection attempt more time
 dns.setDefaultResultOrder("ipv4first");
@@ -82,12 +84,6 @@ async function withRetry<T>(label: string, fn: () => Promise<T>, tries = 4): Pro
 const EXAM_LANG = process.env.EXAM_LANG === "en" ? "en" : "de";
 const LANG_NAME = EXAM_LANG === "en" ? "English" : "German";
 
-const TOPICS = {
-  user: "Beschreiben Sie Ihre Heimatstadt",
-  partner: "Sollte Online-Lernen Schulen ersetzen?",
-  debate: "Sollten soziale Medien für Jugendliche begrenzt werden?",
-};
-
 const BASE_RULES = `
 STRICT RULES:
 - NEVER answer for the student and NEVER give model answers or example answers.
@@ -102,7 +98,8 @@ const SHORT_RULES = `${BASE_RULES}
 const EXAMINER = `You are Rachel, the EXAMINER (invigilator) of a German B2 speaking exam. You are not a candidate. You never give opinions on the topics.`;
 const PARTNER = `You are Josh, the speaking PARTNER (the second candidate) in a German B2 speaking exam. You are NOT the examiner and you never evaluate or score.`;
 
-const SYSTEM_PROMPTS: Record<string, string> = {
+// prompts are built for the topics chosen for this exam
+const makePrompts = (TOPICS: ExamTopics): Record<string, string> => ({
   PREPARATION: `${EXAMINER}
 On your first turn, in 5 to 6 short sentences: greet both participants, the student and Josh the speaking partner, welcome the two of them, say you are the examiner, tell the student their own topic is \"${TOPICS.user}\", tell them Josh will present \"${TOPICS.partner}\", say the student presents first, then Josh, with questions after each presentation, then a debate on \"${TOPICS.debate}\", and that they now have preparation time. After that, answer only questions about the format, in one short sentence.
 ${BASE_RULES}`,
@@ -133,16 +130,17 @@ On your first turn, say in one short sentence that the student may now ask a que
 ${BASE_RULES}`,
 
   DEBATE: `${PARTNER}
-You are now debating with the student. Topic: \"${TOPICS.debate}\". You argue FOR limiting social media. Both of you try to reach a consensus.
+You are now debating with the student. Topic: \"${TOPICS.debate}\". You argue ${TOPICS.stance === "FOR" ? "FOR the proposal in the question (your answer is yes)" : "AGAINST the proposal in the question (your answer is no)"}. Both of you try to reach a consensus.
 On your first turn, state your position in one or two sentences and ask for the student's view. After that, answer their arguments with one short counter-argument and acknowledge good points. After about three exchanges, suggest a reasonable compromise to reach consensus, and if the student agrees, accept it.
-${SHORT_RULES}`,
+${SHORT_RULES}
+- Only when the student has clearly agreed to a compromise and you accept it, end that reply with the exact marker [[CONSENSUS]]. Never use the marker otherwise.`,
 
   RESULT: `You are Rachel, the German B2 exam examiner, giving the final result.
 Judge only the student, not Josh. Base it only on what the student actually said in this conversation: the presentation, the answer to Josh's question, the question and feedback to Josh, and the debate. If the student said very little, score low.
 Reply with ONLY a JSON object, no other text, in this exact shape:
 {"vocabulary": 0-10, "grammar": 0-10, "fluency": 0-10, "interaction": 0-10, "feedback": "..."}
 "feedback" is plain English, maximum 5 short sentences, no markdown, ending with one sentence of encouragement. Do not put scores in the feedback text.`,
-};
+});
 
 // change the voices in backend/.env (VOICE_EXAMINER_ID, VOICE_PARTNER_ID), no code edit needed
 const VOICES: Record<string, string> = {
@@ -176,6 +174,23 @@ const NEXT_STAGE: Record<string, string | undefined> = {
 const SILENT_STAGES = new Set(["USER_PRESENTATION"]);
 // stages where the AI speaks alone (or students prepare silently) and student audio is ignored
 const AI_ONLY_STAGES = new Set(["PREPARATION", "INTRO", "PARTNER_PRESENTATION"]);
+
+// ---------- live turn-taking settings (change the numbers here) ----------
+const TURN_STAGES = new Set(["USER_QA", "PARTNER_QA", "DEBATE"]); // AI answers by itself when the student stops
+const TURN_WAIT_MS = 900; // wait after a transcript before the AI answers (student may continue)
+const TURN_FILLER_MS = 2500; // wait longer when the student stopped on "und", "also", "weil"...
+const PRES_MIN_WORDS = 40; // words needed before silence can end the presentation
+const PRES_IDLE_MS = 8000; // silence that ends the presentation (about 10 s in total with detection and speech recognition)
+const DEBATE_MIN_TURNS_FOR_CONSENSUS = 4;
+const DEBATE_MIN_TURNS_FOR_CLOSING = 3;
+
+const CLOSING_RE =
+  /(das war (meine|unsere) pr[äa]sentation|das war['’]?s|das wars|vielen dank f[üu]r (ihre|eure|deine) aufmerksamkeit|ich bin (jetzt |damit )?fertig|damit bin ich fertig|ende meiner pr[äa]sentation|danke f[üu]r die diskussion)[\s.!,]*$/i;
+const FILLER_END_RE = /(?:^|\s)(und|also|weil|aber|oder|dass|denn|dann|sondern|damit|obwohl|äh|ähm|ehm)[\s.,…-]*$/i;
+
+function endsWithClosing(text: string): boolean {
+  return CLOSING_RE.test(text.trim().slice(-90));
+}
 
 // stage triggers are instructions to the model, never student speech
 const STAGE_TRIGGERS: Record<string, string> = {
@@ -291,11 +306,104 @@ wss.on("connection", (ws: WebSocket, req) => {
   console.log("Client connected:", ip);
 
   let currentStage = "PREPARATION";
+  let topics: ExamTopics = pickTopics();
+  let prompts = makePrompts(topics);
   let currentLang: "de" | "en" = "de";
   const sessionId = "session_" + Date.now();
   sessions.set(sessionId, []);
 
-  async function generateAndSpeak(userText: string | null, stage: string): Promise<void> {
+  // ---------- live turn-taking state (per connection) ----------
+  let userSpeaking = false; // the page says the student is speaking right now
+  let inflight = 0; // AI turns being generated or sent
+  let pending: string[] = []; // student sentences not answered yet
+  let liveTimer: ReturnType<typeof setTimeout> | undefined;
+  let presWords = 0;
+  let studentTurns = 0;
+  let closingSaid = false;
+  let autoNextSent = false;
+
+  function clearLive() {
+    if (liveTimer) clearTimeout(liveTimer);
+    liveTimer = undefined;
+  }
+
+  function resetStageState() {
+    clearLive();
+    pending = [];
+    presWords = 0;
+    studentTurns = 0;
+    closingSaid = false;
+    userSpeaking = false;
+    autoNextSent = false;
+  }
+
+  // tells the page to move on; the page then sends stage_change as usual
+  function autoNext(afterAudio: boolean) {
+    const nxt = NEXT_STAGE[currentStage];
+    if (!nxt || autoNextSent) return;
+    autoNextSent = true;
+    console.log("Auto next:", currentStage, "->", nxt);
+    ws.send(JSON.stringify({ type: "auto_next", from: currentStage, to: nxt, afterAudio }));
+  }
+
+  // decides what happens after the student stopped talking
+  function armLive() {
+    clearLive();
+    if (userSpeaking || inflight > 0 || autoNextSent) return;
+    if (currentStage === "USER_PRESENTATION") {
+      if (closingSaid) liveTimer = setTimeout(() => autoNext(false), 700);
+      else if (presWords >= PRES_MIN_WORDS) liveTimer = setTimeout(() => autoNext(false), PRES_IDLE_MS);
+      return;
+    }
+    if (TURN_STAGES.has(currentStage) && pending.length > 0) {
+      const joined = pending.join(" ");
+      const wait = closingSaid ? 300 : FILLER_END_RE.test(joined) ? TURN_FILLER_MS : TURN_WAIT_MS;
+      liveTimer = setTimeout(() => void answerPending(), wait);
+    }
+  }
+
+  async function answerPending(): Promise<void> {
+    liveTimer = undefined;
+    if (inflight > 0 || pending.length === 0 || userSpeaking) return;
+    const text = pending.join(" ").trim();
+    pending = [];
+    const stage = currentStage;
+    const closing = closingSaid;
+    closingSaid = false;
+    studentTurns += 1;
+
+    // the student ends the debate by saying a closing phrase
+    if (stage === "DEBATE" && closing && studentTurns >= DEBATE_MIN_TURNS_FOR_CLOSING) {
+      const h = sessions.get(sessionId) || [];
+      h.push({ role: "user", content: text });
+      sessions.set(sessionId, h);
+      autoNext(false);
+      return;
+    }
+
+    const r = await generateAndSpeak(text, stage);
+    if (currentStage !== stage) return; // stage changed while the AI was answering
+
+    let advance = false;
+    if (stage === "USER_QA") advance = true; // Josh answered once: on to Josh's presentation
+    else if (stage === "PARTNER_QA") advance = /\?/.test(text) || studentTurns >= 2; // the student asked the question
+    else if (stage === "DEBATE") advance = r.consensus && studentTurns >= DEBATE_MIN_TURNS_FOR_CONSENSUS;
+
+    if (advance) autoNext(r.audioSent);
+    else armLive(); // the student may have spoken while the AI answered
+  }
+
+  async function generateAndSpeak(userText: string | null, stage: string): Promise<{ audioSent: boolean; consensus: boolean }> {
+    inflight += 1;
+    try {
+      return await generateAndSpeakInner(userText, stage);
+    } finally {
+      inflight -= 1;
+    }
+  }
+
+  async function generateAndSpeakInner(userText: string | null, stage: string): Promise<{ audioSent: boolean; consensus: boolean }> {
+    let consensus = false;
     try {
       ws.send(JSON.stringify({ type: "processing" }));
 
@@ -313,7 +421,7 @@ wss.on("connection", (ws: WebSocket, req) => {
         model: "openai/gpt-oss-120b",
         reasoning_effort: "low",
         messages: [
-          { role: "system" as const, content: (SYSTEM_PROMPTS[stage] || SYSTEM_PROMPTS["PREPARATION"]) + "\n\nREPLY LANGUAGE: " + (isResult || currentLang === "en" ? "English" : "German") + " only." + trigger },
+          { role: "system" as const, content: (prompts[stage] || prompts["PREPARATION"]) + "\n\nREPLY LANGUAGE: " + (isResult || currentLang === "en" ? "English" : "German") + " only." + trigger },
           ...history.map((m) => ({
             role: (m.role === "user" ? "user" : "assistant") as "user" | "assistant",
             content: m.content || "",
@@ -325,7 +433,8 @@ wss.on("connection", (ws: WebSocket, req) => {
       });
 
       const rawText = response.choices[0]?.message?.content || "";
-      let aiText = rawText.replace(/[*#_`]/g, "").trim();
+      consensus = /\[\[\s*CONSENSUS\s*\]\]/i.test(rawText);
+      let aiText = rawText.replace(/\[\[\s*CONSENSUS\s*\]\]/gi, "").replace(/[*#_`]/g, "").trim();
       let scores: Scores | null = null;
 
       if (isResult) {
@@ -376,7 +485,7 @@ wss.on("connection", (ws: WebSocket, req) => {
         const err = await ttsRes.text();
         console.error("Cartesia error:", err);
         ws.send(JSON.stringify({ type: "error", message: err }));
-        return;
+        return { audioSent: false, consensus };
       }
 
       const audioBuffer = await ttsRes.arrayBuffer();
@@ -385,6 +494,7 @@ wss.on("connection", (ws: WebSocket, req) => {
 
       ws.send(JSON.stringify({ type: "audio_mp3", data: audioBase64 }));
       ws.send(JSON.stringify({ type: "turn_complete" }));
+      return { audioSent: true, consensus };
 
     } catch (err) {
       console.error("generateAndSpeak error:", errText(err));
@@ -396,6 +506,7 @@ wss.on("connection", (ws: WebSocket, req) => {
       }
       ws.send(JSON.stringify({ type: "error", message: "Network problem. Please speak again." }));
       ws.send(JSON.stringify({ type: "turn_complete" }));
+      return { audioSent: false, consensus: false };
     }
   }
 
@@ -414,10 +525,17 @@ wss.on("connection", (ws: WebSocket, req) => {
             ws.close(4001, "Daily limit");
             return;
           }
+          // new topics for every exam; the page sends the topics it already had and the current ones when it reconnects
+          const m2 = msg as unknown as Record<string, unknown>;
+          const cur = m2["current"] as { ids?: unknown; stance?: unknown } | undefined;
+          topics = resolveTopics(cur?.ids, cur?.stance) || pickTopics(m2["seen"] as Record<string, string[]> | undefined);
+          prompts = makePrompts(topics);
+          console.log("Topics:", topics.user, "|", topics.partner, "|", topics.debate, "| Josh", topics.stance);
           currentStage = wanted;
+          resetStageState();
           sessions.set(sessionId, []);
           ws.send(JSON.stringify({ type: "connected", stage: currentStage }));
-          ws.send(JSON.stringify({ type: "topics", data: TOPICS }));
+          ws.send(JSON.stringify({ type: "topics", data: topics }));
 
           await generateAndSpeak(null, currentStage);
         }
@@ -430,8 +548,21 @@ wss.on("connection", (ws: WebSocket, req) => {
             return;
           }
           currentStage = nextStage;
+          resetStageState();
 
           await generateAndSpeak(null, currentStage);
+        }
+
+        if (msg["type"] === "speaking") {
+          // the page tells us when the student starts talking, so the AI never cuts in
+          const v = (msg as unknown as Record<string, unknown>)["value"];
+          if (v === true) {
+            userSpeaking = true;
+            clearLive();
+          } else {
+            userSpeaking = false;
+            armLive();
+          }
         }
 
         if (msg["type"] === "interrupt") {
@@ -440,7 +571,11 @@ wss.on("connection", (ws: WebSocket, req) => {
         }
 
       } else {
-        if (data.length < 3000) return;
+        userSpeaking = false; // this audio is the end of the student's sentence
+        if (data.length < 3000) {
+          armLive();
+          return;
+        }
 
         if (AI_ONLY_STAGES.has(currentStage)) {
           ws.send(JSON.stringify({ type: "turn_complete" }));
@@ -489,7 +624,21 @@ wss.on("connection", (ws: WebSocket, req) => {
           if (last && last.role === "user") last.content += " " + userText;
           else hist.push({ role: "user", content: userText });
           sessions.set(sessionId, hist);
+
+          // presentation ends by itself: closing phrase, or enough words and then silence
+          presWords += userText.split(/\s+/).filter(Boolean).length;
+          if (presWords >= 25 && endsWithClosing(userText)) closingSaid = true;
           ws.send(JSON.stringify({ type: "turn_complete" }));
+          armLive();
+          return;
+        }
+
+        if (TURN_STAGES.has(currentStage)) {
+          // collect the sentence; the AI answers when the student has really stopped
+          pending.push(userText);
+          if (endsWithClosing(userText)) closingSaid = true;
+          ws.send(JSON.stringify({ type: "turn_complete" }));
+          armLive();
           return;
         }
 
@@ -506,6 +655,7 @@ wss.on("connection", (ws: WebSocket, req) => {
   ws.on("close", () => {
     console.log("Client disconnected");
     clearTimeout(sessionKiller);
+    clearLive();
     const n = (connectionsPerIp.get(ip) || 1) - 1;
     if (n <= 0) connectionsPerIp.delete(ip);
     else connectionsPerIp.set(ip, n);

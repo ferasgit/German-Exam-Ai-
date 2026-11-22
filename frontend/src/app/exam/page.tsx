@@ -53,6 +53,7 @@ const SPEECH_MARGIN = 8;
 const MIN_THRESHOLD = 22;
 const IDLE_RESTART_MS = 3000;
 const AFTER_AI_IGNORE_MS = 700;
+const SILENCE_MS = 800; // silence before a spoken sentence is sent (was 1200)
 
 // FIX 1: Dynamic WS URL for secure wss:// in production
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8787/voice";
@@ -94,10 +95,19 @@ export default function ExamPage() {
   const recorderBusyRef = useRef(false);
   const lastRestartRef = useRef(0);
   const interruptSentRef = useRef(false);
+  const resultPendingRef = useRef(false); // real scores arrived, show them when Rachel finished speaking
+  const autoNextAfterAudioRef = useRef(false); // backend asked to move on once the AI finished speaking
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   
   const handleStageChangeRef = useRef<((s: ExamStage) => void) | null>(null);
+
+  // tells the backend when the student starts or stops talking, so the AI never cuts in
+  const sendSpeaking = useCallback((value: boolean) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "speaking", value }));
+    }
+  }, []);
 
   useEffect(() => {
     stageRef.current = stage;
@@ -111,11 +121,13 @@ export default function ExamPage() {
     chatScrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const topics = {
-    speech1: "Beschreiben Sie Ihre Heimatstadt.",
-    speech2: "Sollte Online-Lernen Schulen ersetzen?",
-    debate: "Sollten soziale Medien für Jugendliche begrenzt werden?",
-  };
+  // topics now come from the backend for every exam (placeholder text until the exam starts)
+  const [topics, setTopics] = useState({
+    speech1: "Das Thema wird beim Start gewählt.",
+    speech2: "Das Thema wird beim Start gewählt.",
+    debate: "Das Thema wird beim Start gewählt.",
+  });
+  const currentTopicsRef = useRef<unknown>(null); // topics of the running exam, sent again if the page reconnects
 
   // =========================
   // FIX 3: ENFORCED TIMER LOGIC
@@ -207,8 +219,23 @@ export default function ExamPage() {
           setIsAiBusy(false); // AI finished speaking, unlock UI
 
           const currentStg = stageRef.current;
+
+          if (currentStg === "RESULT" && resultPendingRef.current) {
+            resultPendingRef.current = false;
+            setShowResultModal(true);
+          }
           
-          if (AUTO_ADVANCE_STAGES.includes(currentStg)) {
+          if (autoNextAfterAudioRef.current) {
+            // the backend decided this part is over: move on after the AI finished speaking
+            autoNextAfterAudioRef.current = false;
+            setStatus("Weiter zum nächsten Teil...");
+            setTimeout(() => {
+              const nxt = NEXT_STAGE[currentStg];
+              if (nxt && stageRef.current === currentStg && handleStageChangeRef.current) {
+                handleStageChangeRef.current(nxt);
+              }
+            }, 1200);
+          } else if (AUTO_ADVANCE_STAGES.includes(currentStg)) {
             setStatus("AI finished. Auto-advancing...");
             setTimeout(() => {
               const nxt = NEXT_STAGE[currentStg];
@@ -249,7 +276,10 @@ export default function ExamPage() {
   );
 
   const processSpeech = useCallback(async () => {
-    if (isSpeakingRef.current || !mediaRecorderRef.current || isAiBusy) return;
+    if (isSpeakingRef.current || !mediaRecorderRef.current || isAiBusy) {
+      sendSpeaking(false);
+      return;
+    }
 
     const voicedMs = voicedMsRef.current;
     voicedMsRef.current = 0;
@@ -273,13 +303,17 @@ export default function ExamPage() {
     recorderBusyRef.current = false;
 
     if (voicedMs < MIN_VOICED_MS) {
+      sendSpeaking(false);
       if (!AUTO_ADVANCE_STAGES.includes(stageRef.current)) {
         setStatus("Listening... speak now 🎤");
       }
       return;
     }
 
-    if (audioBlob.size < 3000) return;
+    if (audioBlob.size < 3000) {
+      sendSpeaking(false);
+      return;
+    }
 
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       setStatus("Processing speech...");
@@ -287,7 +321,7 @@ export default function ExamPage() {
       const arrayBuffer = await audioBlob.arrayBuffer();
       wsRef.current.send(arrayBuffer);
     }
-  }, [isAiBusy]);
+  }, [isAiBusy, sendSpeaking]);
 
   const connectWS = useCallback(
     async (currentStage: ExamStage) => {
@@ -311,7 +345,14 @@ export default function ExamPage() {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        ws.send(JSON.stringify({ type: "start", stage: currentStage }));
+        // send the topics already used (so they are not repeated) and the current ones (kept when reconnecting)
+        let seen: unknown = undefined;
+        try {
+          seen = JSON.parse(localStorage.getItem("seenTopics") || "null") ?? undefined;
+        } catch {
+          seen = undefined;
+        }
+        ws.send(JSON.stringify({ type: "start", stage: currentStage, seen, current: currentTopicsRef.current ?? undefined }));
       };
 
       ws.onmessage = async (event) => {
@@ -321,6 +362,49 @@ export default function ExamPage() {
           if (msg.type === "connected") {
             setConnected(true);
             setStatus("Connected! Starting...");
+          }
+
+          if (msg.type === "topics") {
+            const d = msg.data as { user: string; partner: string; debate: string; stance: string; ids: { user: string; partner: string; debate: string } };
+            setTopics({ speech1: d.user, speech2: d.partner, debate: d.debate });
+            currentTopicsRef.current = { ids: d.ids, stance: d.stance };
+            // remember which topics this student has had
+            try {
+              const old = JSON.parse(localStorage.getItem("seenTopics") || "null") || {};
+              const presentation = Array.from(new Set([...(old.presentation || []), d.ids.user, d.ids.partner])).slice(-300);
+              const debate = Array.from(new Set([...(old.debate || []), d.ids.debate])).slice(-300);
+              localStorage.setItem("seenTopics", JSON.stringify({ presentation, debate }));
+            } catch {
+              /* storage not available: topics may repeat */
+            }
+          }
+
+          if (msg.type === "turn_complete") {
+            // nothing more is coming: unlock the mic unless the AI is still speaking
+            if (!isPlayingRef.current) {
+              setIsAiBusy(false);
+              if (!AUTO_ADVANCE_STAGES.includes(stageRef.current)) setStatus("Listening... speak now 🎤");
+              if (stageRef.current === "RESULT" && resultPendingRef.current) {
+                resultPendingRef.current = false;
+                setShowResultModal(true);
+              }
+            }
+          }
+
+          if (msg.type === "auto_next") {
+            // the backend decided this part is over (closing phrase, silence, Josh answered, consensus)
+            const from = msg.from as ExamStage;
+            const nxt = NEXT_STAGE[stageRef.current];
+            if (from !== stageRef.current || !nxt) return;
+            if (msg.afterAudio && isPlayingRef.current) {
+              autoNextAfterAudioRef.current = true; // advance when the audio ends
+            } else {
+              setTimeout(() => {
+                if (stageRef.current === from && handleStageChangeRef.current) {
+                  handleStageChangeRef.current(nxt);
+                }
+              }, msg.afterAudio ? 1200 : 600);
+            }
           }
 
           if (msg.type === "processing") {
@@ -336,6 +420,16 @@ export default function ExamPage() {
                 : "examiner";
             setActiveSpeaker(speakerRole);
             await playAudioMp3(msg.data as string);
+          }
+
+          // Real scores from the backend (sent at the RESULT stage)
+          if (msg.type === "result_scores") {
+            const d = msg.data as { vocabulary: number; grammar: number; fluency: number; interaction: number; overall: number };
+            setExamEvaluation({
+              score: d.overall,
+              breakdown: { vocabulary: d.vocabulary, grammar: d.grammar, fluency: d.fluency, interaction: d.interaction },
+            });
+            resultPendingRef.current = true;
           }
 
           // FIX 4: Real Backend Scoring Integration
@@ -405,6 +499,11 @@ export default function ExamPage() {
             console.warn("Backend Error Handled");
             setStatus("Network problem — please speak again 🎤");
             setIsAiBusy(false);
+            isPlayingRef.current = false;
+            if (stageRef.current === "RESULT" && resultPendingRef.current) {
+              resultPendingRef.current = false;
+              setShowResultModal(true);
+            }
           }
         } catch (err) {
           console.error("WS message error:", err);
@@ -485,6 +584,7 @@ export default function ExamPage() {
             speechDetectedRef.current = true;
             setActiveSpeaker("user");
             setStatus("Speaking... 🎤");
+            sendSpeaking(true);
           }
           if (silenceTimerRef.current) {
             clearTimeout(silenceTimerRef.current);
@@ -497,7 +597,7 @@ export default function ExamPage() {
               setActiveSpeaker(null);
               silenceTimerRef.current = null;
               await processSpeech();
-            }, 1200);
+            }, SILENCE_MS);
           }
         }
 
@@ -519,12 +619,14 @@ export default function ExamPage() {
       console.error("Mic error:", err);
       setStatus("Microphone access denied or error");
     }
-  }, [processSpeech, restartRecorder, isAiBusy]);
+  }, [processSpeech, restartRecorder, isAiBusy, sendSpeaking]);
 
   function handleStageChange(newStage: ExamStage) {
     setStage(newStage);
     stageRef.current = newStage;
     setIsAiBusy(false);
+    autoNextAfterAudioRef.current = false;
+    if (newStage !== "RESULT") resultPendingRef.current = false;
     
     if (AUTO_ADVANCE_STAGES.includes(newStage)) {
       setStatus("Nur Zuhören (AI speaking)");
@@ -566,6 +668,7 @@ export default function ExamPage() {
   handleStageChangeRef.current = handleStageChange;
 
   async function startExam() {
+    currentTopicsRef.current = null; // a new exam gets new topics
     setExamStarted(true);
     setStatus("Starting...");
     await startMic();
@@ -971,9 +1074,9 @@ export default function ExamPage() {
             <div className="space-y-2.5 mb-5">
               {[
                 { k: "Wortschatz (Vocabulary)", v: `${examEvaluation?.breakdown?.vocabulary || 0} / 10` },
-                { k: "Aufgabenerfüllung (Task)", v: `${examEvaluation?.breakdown?.taskCompletion || 0} / 10` },
                 { k: "Formale Richtigkeit (Grammar)", v: `${examEvaluation?.breakdown?.grammar || 0} / 10` },
-                { k: "Aussprache (Pronunciation)", v: `${examEvaluation?.breakdown?.pronunciation || 0} / 10` },
+                { k: "Flüssigkeit (Fluency)", v: `${examEvaluation?.breakdown?.fluency || 0} / 10` },
+                { k: "Interaktion (Interaction)", v: `${examEvaluation?.breakdown?.interaction || 0} / 10` },
               ].map((item, i) => (
                 <div
                   key={i}
