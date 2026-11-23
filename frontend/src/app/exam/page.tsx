@@ -891,34 +891,25 @@ export default function ExamPage() {
             ))}
           </div>
 
-          {/* ACTION BUTTONS */}
-          <div className="grid grid-cols-2 gap-3 pt-3 border-t border-neutral-800/60 mt-2">
-            {!examStarted ? (
-              <button
-                onClick={startExam}
-                className="col-span-2 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black font-extrabold py-3 rounded-xl text-xs shadow-lg shadow-emerald-500/20 transition-all uppercase tracking-wider"
-              >
-                🎓 Start Exam
-              </button>
-            ) : (
-              <>
-                <button
-                  onClick={nextStage}
-                  disabled={stage === "RESULT" || !connected || isAiBusy}
-                  className="bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold py-2.5 rounded-xl text-xs border border-neutral-700 transition-all"
-                >
-                  Skip to Next &rarr;
-                </button>
-                <button
-                  onClick={endAll}
-                  disabled={!connected}
-                  className="bg-rose-950/40 hover:bg-rose-900/60 disabled:opacity-40 text-rose-300 font-bold py-2.5 rounded-xl text-xs border border-rose-800/50 transition-all"
-                >
-                  End Call &#10005;
-                </button>
-              </>
-            )}
-          </div>
+         {/* ACTION BUTTONS */}
+<div className="grid grid-cols-2 gap-3 pt-3 border-t border-neutral-800/60 mt-2">
+  {!examStarted ? (
+    <button
+      onClick={startExam}
+      className="col-span-2 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black font-extrabold py-3 rounded-xl text-xs shadow-lg shadow-emerald-500/20 transition-all uppercase tracking-wider"
+    >
+      Start Exam
+    </button>
+  ) : (
+    <button
+      onClick={endAll}
+      disabled={!connected}
+      className="col-span-2 mx-auto px-8 bg-rose-950/40 hover:bg-rose-900/60 disabled:opacity-40 text-rose-300 font-bold py-2.5 rounded-xl text-xs border border-rose-800/50 transition-all"
+    >
+      End Call &#10005;
+    </button>
+  )}
+</div>
         </section>
 
         {/* MIDDLE COLUMN: EXAM TOPICS */}
