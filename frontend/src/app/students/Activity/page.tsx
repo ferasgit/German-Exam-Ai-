@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import "./Practise.css";
+import "./Activity.css";
 
 type Word = {
   id: number;
@@ -16,6 +16,8 @@ type Word = {
   exampleEnglish: string;
   grammar: string;
 };
+
+type ActivitySection = "home" | "dictionary" | "cards" | "sprint";
 
 const WORDS: Word[] = [
   { id: 1, german: "Haus", english: "house", article: "das", plural: "Häuser", category: "Noun", level: "A1", example: "Das Haus ist groß.", exampleEnglish: "The house is big.", grammar: "Neuter noun · Plural: Häuser" },
@@ -50,12 +52,21 @@ const WORDS: Word[] = [
   { id: 30, german: "verbessern", english: "to improve", category: "Verb", level: "B1", example: "Ich möchte mein Deutsch verbessern.", exampleEnglish: "I want to improve my German.", grammar: "Regular verb · verbessert · verbesserte · hat verbessert" },
 ];
 
+const SPRINT_WORDS = [
+  { noun: "Ausbildung", article: "die", translation: "Vocational Training" },
+  { noun: "Krankenhaus", article: "das", translation: "Hospital" },
+  { noun: "Beruf", article: "der", translation: "Profession" },
+  { noun: "Entscheidung", article: "die", translation: "Decision" },
+  { noun: "Haus", article: "das", translation: "House" },
+  { noun: "Freund", article: "der", translation: "Friend" },
+];
+
 const LEVELS = ["All", "A1", "A2", "B1"] as const;
 const CATEGORIES = ["All", "Noun", "Verb", "Adjective", "Adverb", "Pronoun", "Preposition", "Conjunction", "Article"];
 
-export default function PracticePage() {
+export default function ActivityPage() {
   const router = useRouter();
-  const [section, setSection] = useState<"home" | "dictionary" | "cards">("home");
+  const [section, setSection] = useState<ActivitySection>("home");
   const [query, setQuery] = useState("");
   const [level, setLevel] = useState("All");
   const [category, setCategory] = useState("All");
@@ -66,22 +77,32 @@ export default function PracticePage() {
   const [showFavorites, setShowFavorites] = useState(false);
   const [deck, setDeck] = useState<Word[]>(WORDS);
 
+  // Article Sprint State
+  const [sprintIndex, setSprintIndex] = useState(0);
+  const [sprintXp, setSprintXp] = useState(0);
+  const [sprintFeedback, setSprintFeedback] = useState<{ text: string; ok: boolean } | null>(null);
+
   useEffect(() => {
     try {
-      setFavorites(JSON.parse(localStorage.getItem("german-practice-favorites") || "[]"));
-      setKnown(JSON.parse(localStorage.getItem("german-practice-known") || "[]"));
+      setFavorites(JSON.parse(localStorage.getItem("german-activity-favorites") || "[]"));
+      setKnown(JSON.parse(localStorage.getItem("german-activity-known") || "[]"));
+      setSprintXp(Number(localStorage.getItem("german-activity-xp") || "0"));
     } catch {
       // Ignore storage errors
     }
   }, []);
 
   useEffect(() => {
-    localStorage.setItem("german-practice-favorites", JSON.stringify(favorites));
+    localStorage.setItem("german-activity-favorites", JSON.stringify(favorites));
   }, [favorites]);
 
   useEffect(() => {
-    localStorage.setItem("german-practice-known", JSON.stringify(known));
+    localStorage.setItem("german-activity-known", JSON.stringify(known));
   }, [known]);
+
+  useEffect(() => {
+    localStorage.setItem("german-activity-xp", String(sprintXp));
+  }, [sprintXp]);
 
   const filtered = useMemo(
     () =>
@@ -123,7 +144,21 @@ export default function PracticePage() {
     setFlipped([]);
   };
 
-  const openSection = (next: "home" | "dictionary" | "cards") => {
+  const handleArticleGuess = (guess: string) => {
+    const current = SPRINT_WORDS[sprintIndex];
+    if (guess === current.article) {
+      setSprintFeedback({ text: "✅ +15 XP", ok: true });
+      setSprintXp((prev) => prev + 15);
+      setTimeout(() => {
+        setSprintFeedback(null);
+        setSprintIndex((prev) => (prev + 1) % SPRINT_WORDS.length);
+      }, 800);
+    } else {
+      setSprintFeedback({ text: `❌ ${current.article} ${current.noun}`, ok: false });
+    }
+  };
+
+  const openSection = (next: ActivitySection) => {
     setSection(next);
     setQuery("");
     setLevel("All");
@@ -134,113 +169,125 @@ export default function PracticePage() {
     setDeck(WORDS);
   };
 
+  const sectionTitle =
+    section === "home"
+      ? "Dashboard"
+      : section === "dictionary"
+      ? "German Dictionary"
+      : section === "cards"
+      ? "Flashcards"
+      : "Article Sprint";
+
   return (
-    <main className="practice-shell">
-      <aside className="p-sidebar">
-        <button className="p-back-btn" onClick={() => router.push("/students")}>
+    <main className="activity-shell">
+      <aside className="a-sidebar">
+        <button className="a-back-btn" onClick={() => router.push("/students")}>
           &larr; Back to Hub
         </button>
 
-        <div className="p-brand">
-          <div className="p-brand-mark">DE</div>
-          <div className="p-brand-text">
-            Deutsch<span>Practice</span>
-          </div>
+        <div className="a-brand">
+          <div className="a-brand-mark">DE</div>
+          <div className="a-brand-text">Activity</div>
         </div>
 
-        <div className="p-side-label">Workspace</div>
+        <div className="a-side-label">Activity Space</div>
         <button
-          className={`p-nav-link ${section === "home" ? "active" : ""}`}
+          className={`a-nav-link ${section === "home" ? "active" : ""}`}
           onClick={() => openSection("home")}
         >
           Dashboard
         </button>
         <button
-          className={`p-nav-link ${section === "dictionary" ? "active" : ""}`}
+          className={`a-nav-link ${section === "dictionary" ? "active" : ""}`}
           onClick={() => openSection("dictionary")}
         >
           German Dictionary
         </button>
         <button
-          className={`p-nav-link ${section === "cards" ? "active" : ""}`}
+          className={`a-nav-link ${section === "cards" ? "active" : ""}`}
           onClick={() => openSection("cards")}
         >
           Flashcards
         </button>
+        <button
+          className={`a-nav-link ${section === "sprint" ? "active" : ""}`}
+          onClick={() => openSection("sprint")}
+        >
+          Article Sprint
+        </button>
 
-        <div className="p-sidebar-foot">
-          <span className="p-level-badge">A1 – B1</span>
-          <p>Build German vocabulary and grammar mastery daily.</p>
+        <div className="a-sidebar-foot">
+          <span className="a-level-badge">A1 – B1</span>
+          <p>Daily drills, vocabulary lookup, and unlimited XP.</p>
         </div>
       </aside>
 
-      <section className="p-main">
-        <header className="p-topbar">
+      <section className="a-main">
+        <header className="a-topbar">
           <div>
-            <span className="p-eyebrow">Practice Space</span>
-            <div className="p-top-title">
-              {section === "home"
-                ? "Dashboard"
-                : section === "dictionary"
-                ? "German Dictionary"
-                : "Flashcards"}
-            </div>
+            <span className="a-eyebrow">Activity Space</span>
+            <div className="a-top-title">{sectionTitle}</div>
           </div>
-          <div className="p-sync-pill">
-            <span className="p-dot" /> Progress saved
+          <div className="a-sync-pill">
+            <span className="a-dot" /> Progress saved
           </div>
         </header>
 
-        <div className="p-content">
+        <div className="a-content">
           {section === "home" && (
             <>
-              <div className="p-hero">
-                <div>
-                  <span className="p-eyebrow">Willkommen</span>
-                  <h1>
-                    Build your German <span>every day.</span>
-                  </h1>
-                  <p>
-                    Explore essential vocabulary, review grammar notes, and test your memory with interactive flashcards.
-                  </p>
-                  <button className="p-primary-btn" onClick={() => openSection("cards")}>
-                    Start Flashcards &rarr;
-                  </button>
-                </div>
+              <div className="a-hero">
+                <span className="a-eyebrow">Daily Activity</span>
+                <h1>
+                  Sharpen your German <span>every day.</span>
+                </h1>
+                <p>
+                  Look up words in the dictionary, flip flashcards for active recall, and earn unlimited XP in Article Sprint.
+                </p>
+                <button className="a-primary-btn" onClick={() => openSection("sprint")}>
+                  Play Article Sprint &rarr;
+                </button>
               </div>
 
-              <div className="p-stats-grid">
-                <div className="p-stat-card">
+              <div className="a-stats-grid">
+                <div className="a-stat-card">
                   <strong>{WORDS.length}</strong>
-                  <span>Total Words</span>
+                  <span>Dictionary Words</span>
                 </div>
-                <div className="p-stat-card">
+                <div className="a-stat-card">
                   <strong>{known.length}</strong>
-                  <span>Mastered</span>
+                  <span>Cards Mastered</span>
                 </div>
-                <div className="p-stat-card">
+                <div className="a-stat-card">
                   <strong>{favorites.length}</strong>
                   <span>Saved Favourites</span>
                 </div>
-                <div className="p-stat-card">
-                  <strong>{Math.round((known.length / WORDS.length) * 100)}%</strong>
-                  <span>Completion</span>
+                <div className="a-stat-card">
+                  <strong>{sprintXp} XP</strong>
+                  <span>Article Sprint XP</span>
                 </div>
               </div>
 
-              <div className="p-tool-grid">
-                <button className="p-tool-card" onClick={() => openSection("dictionary")}>
-                  <span className="p-eyebrow">Explore Words</span>
+              <div className="a-tool-grid">
+                <button className="a-tool-card" onClick={() => openSection("dictionary")}>
+                  <span className="a-eyebrow">Word Explorer</span>
                   <h3>German Dictionary</h3>
-                  <p>Look up meanings, articles, plurals, grammar notes, and real example sentences.</p>
-                  <span className="p-card-link">Open Dictionary &rarr;</span>
+                  <p>Search German or English words, study grammar rules, and save favourites.</p>
+                  <span className="a-card-link">Open Dictionary &rarr;</span>
                 </button>
 
-                <button className="p-tool-card" onClick={() => openSection("cards")}>
-                  <span className="p-eyebrow">Active Recall</span>
+                <button className="a-tool-card" onClick={() => openSection("cards")}>
+                  <span className="a-eyebrow">Active Recall</span>
                   <h3>Flashcards</h3>
                   <p>Flip German vocabulary cards, shuffle the deck, and mark mastered words.</p>
-                  <span className="p-card-link">Start Flashcards &rarr;</span>
+                  <span className="a-card-link">Start Flashcards &rarr;</span>
+                </button>
+
+                <button className="a-tool-card" onClick={() => openSection("sprint")}>
+                  <span className="a-eyebrow">Der · Die · Das</span>
+                  <h3>Article Sprint</h3>
+                  <p>Build instant muscle memory for German noun genders with unlimited XP.</p>
+                  <span className="a-card-link">Play Now &rarr;</span>
                 </button>
               </div>
             </>
@@ -248,82 +295,82 @@ export default function PracticePage() {
 
           {section === "dictionary" && (
             <>
-              <div className="p-page-head">
-                <span className="p-eyebrow">Word Explorer</span>
+              <div className="a-page-head">
+                <span className="a-eyebrow">Word Explorer</span>
                 <h1>German Dictionary</h1>
                 <p>Search by German word or English meaning.</p>
               </div>
 
-              <div className="p-filter-bar">
+              <div className="a-filter-bar">
                 <input
-                  className="p-input"
+                  className="a-input"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="Search German or English..."
                 />
-                <select className="p-select" value={level} onChange={(e) => setLevel(e.target.value)}>
+                <select className="a-select" value={level} onChange={(e) => setLevel(e.target.value)}>
                   {LEVELS.map((x) => (
                     <option key={x}>{x}</option>
                   ))}
                 </select>
-                <select className="p-select" value={category} onChange={(e) => setCategory(e.target.value)}>
+                <select className="a-select" value={category} onChange={(e) => setCategory(e.target.value)}>
                   {CATEGORIES.map((x) => (
                     <option key={x}>{x}</option>
                   ))}
                 </select>
                 <button
-                  className={`p-filter-btn ${showFavorites ? "active" : ""}`}
+                  className={`a-filter-btn ${showFavorites ? "active" : ""}`}
                   onClick={() => setShowFavorites(!showFavorites)}
                 >
                   ♡ Favourites
                 </button>
               </div>
 
-              <div className="p-toolbar">
+              <div className="a-toolbar">
                 <span>{filtered.length} entries found</span>
               </div>
 
               {filtered.length > 0 ? (
-                <div className="p-dict-list">
+                <div className="a-dict-list">
                   {filtered.map((word) => (
-                    <article className="p-dict-row" key={word.id}>
+                    <article className="a-dict-row" key={word.id}>
                       <div>
-                        <div className="p-word-title">
-                          {word.article && <span className="p-article">{word.article}</span>}
+                        <div className="a-word-title">
+                          {word.article && <span className="a-article">{word.article}</span>}
                           {word.german}
                         </div>
-                        <div className="p-word-en">{word.english}</div>
+                        <div className="a-word-en">{word.english}</div>
                       </div>
 
-                      <div className="p-tags">
-                        <span className="p-tag level">{word.level}</span>
-                        <span className="p-tag">{word.category}</span>
+                      <div className="a-tags">
+                        <span className="a-tag level">{word.level}</span>
+                        <span className="a-tag">{word.category}</span>
                       </div>
 
                       <button
-                        className={`p-heart ${favorites.includes(word.id) ? "hearted" : ""}`}
+                        className={`a-heart ${favorites.includes(word.id) ? "hearted" : ""}`}
                         onClick={() => toggleFavorite(word.id)}
                         aria-label="Toggle favourite"
                       >
                         {favorites.includes(word.id) ? "♥" : "♡"}
                       </button>
 
-                      <details className="p-details">
+                      <details className="a-details">
                         <summary>Study details</summary>
-                        <div className="p-detail-box">
+                        <div className="a-detail-box">
                           <p><b>Grammar:</b> {word.grammar}</p>
                           {word.plural && <p><b>Plural:</b> {word.plural}</p>}
                           <p><b>Example:</b> {word.example}</p>
                           <p><b>English:</b> {word.exampleEnglish}</p>
                           <button
-                            className="p-mini-btn"
+                            className="a-mini-btn"
                             onClick={() => {
                               setSection("cards");
                               setDeck(WORDS.filter((w) => w.id === word.id));
                               setPage(0);
                             }}
                           >
-                            Practise this word &rarr;
+                            Review as Flashcard &rarr;
                           </button>
                         </div>
                       </details>
@@ -331,22 +378,22 @@ export default function PracticePage() {
                   ))}
                 </div>
               ) : (
-                <div className="p-empty">No matching words found. Try another search or filter.</div>
+                <div className="a-empty">No matching words found. Try another search or filter.</div>
               )}
             </>
           )}
 
           {section === "cards" && (
             <>
-              <div className="p-page-head">
-                <span className="p-eyebrow">Active Recall</span>
+              <div className="a-page-head">
+                <span className="a-eyebrow">Active Recall</span>
                 <h1>Flashcards</h1>
                 <p>Click any card to reveal its English meaning.</p>
               </div>
 
-              <div className="p-filter-bar">
+              <div className="a-filter-bar">
                 <select
-                  className="p-select"
+                  className="a-select"
                   value={level}
                   onChange={(e) => {
                     setLevel(e.target.value);
@@ -359,7 +406,7 @@ export default function PracticePage() {
                   ))}
                 </select>
                 <select
-                  className="p-select"
+                  className="a-select"
                   value={category}
                   onChange={(e) => {
                     setCategory(e.target.value);
@@ -372,7 +419,7 @@ export default function PracticePage() {
                   ))}
                 </select>
                 <button
-                  className={`p-filter-btn ${showFavorites ? "active" : ""}`}
+                  className={`a-filter-btn ${showFavorites ? "active" : ""}`}
                   onClick={() => {
                     setShowFavorites(!showFavorites);
                     setPage(0);
@@ -380,35 +427,35 @@ export default function PracticePage() {
                 >
                   ♡ Favourites
                 </button>
-                <button className="p-filter-btn" onClick={shuffleCards}>
+                <button className="a-filter-btn" onClick={shuffleCards}>
                   Shuffle Deck
                 </button>
               </div>
 
-              <div className="p-toolbar">
+              <div className="a-toolbar">
                 <span>{cardWords.length} cards in deck</span>
                 <span>{known.length} mastered</span>
               </div>
 
               {pageWords.length > 0 ? (
-                <div className="p-flash-grid">
+                <div className="a-flash-grid">
                   {pageWords.map((word) => {
                     const isFlipped = flipped.includes(word.id);
                     return (
-                      <div className={`p-flash-card ${isFlipped ? "flipped" : ""}`} key={word.id}>
+                      <div className={`a-flash-card ${isFlipped ? "flipped" : ""}`} key={word.id}>
                         <button
-                          className="p-flip-btn"
+                          className="a-flip-btn"
                           onClick={() =>
                             setFlipped((old) =>
                               old.includes(word.id) ? old.filter((id) => id !== word.id) : [...old, word.id]
                             )
                           }
                         >
-                          <span className="p-flash-top">
+                          <span className="a-flash-top">
                             <span>{word.level}</span>
                             <span>{word.category}</span>
                           </span>
-                          <span className="p-flash-word">
+                          <span className="a-flash-word">
                             {isFlipped ? (
                               word.english
                             ) : (
@@ -418,12 +465,12 @@ export default function PracticePage() {
                               </>
                             )}
                           </span>
-                          <span className="p-flip-hint">
+                          <span className="a-flip-hint">
                             {isFlipped ? "Click for German" : "Click to reveal"}
                           </span>
                         </button>
 
-                        <div className="p-flash-actions">
+                        <div className="a-flash-actions">
                           <button
                             onClick={() => toggleFavorite(word.id)}
                             className={favorites.includes(word.id) ? "hearted" : ""}
@@ -442,10 +489,10 @@ export default function PracticePage() {
                   })}
                 </div>
               ) : (
-                <div className="p-empty">No cards match these filters.</div>
+                <div className="a-empty">No cards match these filters.</div>
               )}
 
-              <div className="p-pagination">
+              <div className="a-pagination">
                 <button
                   disabled={page === 0}
                   onClick={() => {
@@ -467,6 +514,46 @@ export default function PracticePage() {
                 >
                   Next &rarr;
                 </button>
+              </div>
+            </>
+          )}
+
+          {section === "sprint" && (
+            <>
+              <div className="a-page-head">
+                <span className="a-eyebrow">Der · Die · Das</span>
+                <h1>Article Sprint</h1>
+                <p>Pick the right German article to build muscle memory. No exam tokens required.</p>
+              </div>
+
+              <div className="a-sprint-card">
+                <div className="a-sprint-meta">
+                  <span>
+                    Word {sprintIndex + 1} of {SPRINT_WORDS.length}
+                  </span>
+                  <span className="a-sprint-xp">{sprintXp} XP</span>
+                </div>
+
+                <div className="a-sprint-prompt">
+                  <p className="a-sprint-noun">___ {SPRINT_WORDS[sprintIndex].noun}</p>
+                  <p className="a-sprint-en">{SPRINT_WORDS[sprintIndex].translation}</p>
+                </div>
+
+                <div className={`a-sprint-feedback ${sprintFeedback ? (sprintFeedback.ok ? "ok" : "err") : ""}`}>
+                  {sprintFeedback?.text}
+                </div>
+
+                <div className="a-sprint-buttons">
+                  {["der", "die", "das"].map((art) => (
+                    <button
+                      key={art}
+                      className="a-sprint-btn"
+                      onClick={() => handleArticleGuess(art)}
+                    >
+                      {art}
+                    </button>
+                  ))}
+                </div>
               </div>
             </>
           )}

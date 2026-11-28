@@ -139,7 +139,7 @@ export default function StudentHubPage() {
             {/* CARD 2: ACTIVITY */}
             <div
               className="portal-card theme-activity"
-              onClick={() => router.push("/students/activity")}
+              onClick={() => router.push("/students/Activity")}
             >
               <div className="portal-top">
                 <span className="portal-badge">Unlimited XP</span>
