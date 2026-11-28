@@ -108,7 +108,7 @@ export default function StudentHubPage() {
             {/* CARD 1: PRACTICE */}
             <div
               className="portal-card theme-practice"
-              onClick={() => router.push("/students/practice")}
+              onClick={() => router.push("/students/Practise")}
             >
               <div className="portal-top">
                 <span className="portal-badge">5 Core Skills</span>
